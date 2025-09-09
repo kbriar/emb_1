@@ -1,0 +1,119 @@
+def get_top_n_matches_both_sources(
+    self, 
+    loss_df: pd.DataFrame, 
+    parts_df: pd.DataFrame, 
+    n: int = 5, 
+    block: int = 4096,
+    corrective_action_col: str = "corrective_action"
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """
+    Generate top-N matches from both part descriptions and corrective actions.
+    Returns: (top_matches_part, top_matches_corrective)
+    """
+    print("Preparing embeddings for top-N from both sources...")
+    
+    # Get regular part embeddings (always available)
+    (loss_mat, loss_idx), (part_mat, part_idx) = self._prep_embeddings(loss_df, parts_df)
+    
+    # Get top matches based on part descriptions
+    top_matches_part = self._get_top_n_from_embeddings(
+        loss_mat, loss_idx, part_mat, part_idx, loss_df, parts_df, n, block, "part_description"
+    )
+    
+    # Get corrective action embeddings if available
+    top_matches_corrective = None
+    if corrective_action_col in parts_df.columns:
+        corrective_mat, corrective_idx, corrective_texts = self._prep_corrective_embeddings(
+            parts_df, corrective_action_col
+        )
+        
+        # FIX: Changed condition to be more lenient - only require that we have some corrective embeddings
+        if corrective_mat is not None and len(corrective_idx) > 0:
+            print(f"Generating top matches from corrective actions... (found {len(corrective_idx)} corrective embeddings)")
+            print(f"Part embeddings: {len(part_idx)}, Corrective embeddings: {len(corrective_idx)}")
+            
+            # Use the original method but only for parts that have corrective embeddings
+            top_matches_corrective = self._get_top_n_from_embeddings(
+                loss_mat, loss_idx, corrective_mat, corrective_idx, loss_df, parts_df, n, block, "corrective_action", corrective_texts
+            )
+        else:
+            print("Warning: No valid corrective embeddings found")
+    
+    return top_matches_part, top_matches_corrective
+
+
+def _prep_corrective_embeddings(
+    self,
+    parts_df: pd.DataFrame,
+    corrective_action_col: str = "corrective_action",
+    part_id_col: str = "spart_no",
+    part_text_col: str = "spart_desc",
+):
+    """
+    Prepare embeddings for corrective actions, extracting relevant parts for each component.
+    Ensure we only process parts that have valid corrective actions.
+    """
+    def _normalize(v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float32)
+        n = np.linalg.norm(v)
+        return (v / n) if n > 0 else v
+
+    use_store = bool(self.embedding_store_path)
+    corrective_store = None
+    
+    if use_store:
+        corrective_path = os.path.join(self.embedding_store_path, "corrective_embeddings.parquet")
+        if os.path.exists(corrective_path):
+            corrective_store = pd.read_parquet(corrective_path)
+
+    # Build CORRECTIVE side - only for parts with valid corrective actions
+    corrective_idx_keep, corrective_vecs = [], []
+    corrective_texts = []
+
+    # First, identify which parts have valid corrective actions
+    valid_parts_mask = []
+    for i in range(len(parts_df)):
+        corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+        if corrective_action and not pd.isna(corrective_action) and str(corrective_action).strip():
+            valid_parts_mask.append(True)
+        else:
+            valid_parts_mask.append(False)
+
+    if corrective_store is not None and not corrective_store.empty:
+        corrective_map = dict(
+            zip(corrective_store[part_id_col].astype(str), corrective_store["embedding"])
+        )
+        for i, pid in enumerate(parts_df[part_id_col].astype(str).tolist()):
+            # Only process if part has valid corrective action
+            if valid_parts_mask[i]:
+                emb = corrective_map.get(pid)
+                if emb is not None:
+                    corrective_idx_keep.append(i)
+                    corrective_vecs.append(_normalize(np.array(emb, dtype=np.float32)))
+                    corrective_texts.append(parts_df.iloc[i][corrective_action_col])
+
+    # Compute missing corrective action embeddings only for valid parts
+    have = set(corrective_idx_keep)
+    missing_rows = [i for i in range(len(parts_df)) if valid_parts_mask[i] and i not in have]
+    
+    if missing_rows:
+        relevant_actions = []
+        for idx in missing_rows:
+            part_desc = parts_df.iloc[idx][part_text_col]
+            full_action = parts_df.iloc[idx][corrective_action_col]
+            relevant_action = self._extract_relevant_corrective_action(full_action, part_desc)
+            relevant_actions.append(relevant_action)
+            corrective_texts.append(full_action)
+
+        miss_embs = self.corrective_cache.get_batch_embeddings(relevant_actions, self.model)
+        
+        for idx_local, e in zip(missing_rows, miss_embs):
+            if e is not None:
+                corrective_idx_keep.append(idx_local)
+                corrective_vecs.append(_normalize(e))
+
+    if not corrective_vecs:
+        return None, None, None
+
+    corrective_mat = np.stack(corrective_vecs).astype(np.float32)
+    return corrective_mat, corrective_idx_keep, corrective_texts
