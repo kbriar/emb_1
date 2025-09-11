@@ -1,0 +1,349 @@
+import re
+
+def clean_claim_text(text):
+    """
+    Cleans text fields from the claim data (CAUSE, CORRECTION, PART_DESC, PART_NO).
+    Removes extra whitespace, converts to lowercase, and handles common issues.
+    """
+    if not isinstance(text, str):
+        return ""
+    
+    # Remove excess whitespace, newlines, tabs
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    # Convert to lowercase for consistent matching
+    text = text.lower()
+    
+    # Optional: Add common autocorrections here
+    # Example: text = text.replace("accompressor", "a/c compressor")
+    # Example: text = text.replace("enginen", "engine")
+    
+    return text
+
+
+
+def adjudicate_loss_code_llm(
+    row: Dict[str, Any],
+    candidate_codes: List[str],
+    loss_code_master: pd.DataFrame,
+    code_col: str = "Loss Code #",
+    desc_col: str = "Category/Description",
+    part_desc_col_in_row: str = "part_description",
+    abstain_threshold: float = 0.72,
+    absolute_quality_threshold: float = 0.65,  # NEW PARAMETER
+    tie_margin: float = 0.03,
+    rank_col: str = None,
+) -> pd.DataFrame:
+    # ... [rest of your existing function code until text extraction] ...
+    
+    claim_id = row.get("claim_id")
+    job_no = row.get("sjob_no")
+    old_code = row.get("loss_code")
+    
+    # CLEAN THE TEXT FIELDS - NEW
+    cause = clean_claim_text(str(row.get("CAUSE", "") or ""))
+    correction = clean_claim_text(str(row.get("CORRECTION", "") or ""))
+    part_desc = clean_claim_text(str(row.get(part_desc_col_in_row, "") or ""))
+    part_no = clean_claim_text(str(row.get("spart_no", "") or ""))
+    
+    # ... [rest of your existing function code] ...
+    
+    # 7) Post-decision guardrails - UPDATED WITH ABSOLUTE THRESHOLD
+    new_code = data["new_loss_code"]
+    confidence = float(data.get("confidence", 0))
+    action = data.get("action", "needs_review")
+    
+    # compute tie/threshold again locally from per_candidate (defensive)
+    per_cand = data.get("per_candidate", [])
+    if per_cand:
+        scores = sorted([c["score"] for c in per_cand], reverse=True)
+        top = scores[0]
+        second = scores[1] if len(scores) > 1 else 0.0
+        
+        # UPDATED LOGIC: Add absolute quality check
+        if (top < abstain_threshold) or (top - second < tie_margin) or (top < absolute_quality_threshold):
+            action = "needs_review"
+    
+    # ... [rest of your existing function code] ...
+
+
+
+
+def adjudicate_loss_code_llm_detailed(
+    row: Dict[str, Any],
+    candidate_codes: List[str],
+    loss_code_master: pd.DataFrame,
+    code_col: str = "sloss_code",
+    desc_col: str = "sdetail_desc",
+    part_desc_col_in_row: str = "part_description",
+    rank_col: str = 'rank_in_part'
+) -> Dict[str, Any]:
+    """
+    Returns the FULL LLM response with per-candidate scores for analysis.
+    Use this to collect data for experimenting with weighted formulas.
+    """
+    if isinstance(row, pd.Series):
+        row = row.to_dict()
+    
+    claim_id = row.get("claim_id")
+    job_no = row.get("sjob_no")
+    old_code = row.get("loss_code")
+    
+    # Use cleaned text
+    cause = clean_claim_text(str(row.get("CAUSE", "") or ""))
+    correction = clean_claim_text(str(row.get("CORRECTION", "") or ""))
+    part_desc = clean_claim_text(str(row.get(part_desc_col_in_row, "") or ""))
+    part_no = clean_claim_text(str(row.get("spart_no", "") or ""))
+    
+    # Slice master to candidates
+    m = loss_code_master[loss_code_master[code_col].isin(candidate_codes)].copy()
+    if desc_col not in m.columns and "Loss Description" in m.columns:
+        m[desc_col] = m["Loss Description"]
+    m[desc_col] = m[desc_col].fillna("")
+    
+    if m.empty:
+        return {
+            "claim_id": claim_id,
+            "job_no": job_no,
+            "old_loss_code": old_code,
+            "candidates_available": False,
+            "llm_response": None
+        }
+    
+    # Build candidate list (unchanged)
+    def _short(s, n=280):
+        s = re.sub(r"\s+", " ", s).strip()
+        return s if len(s) <= n else s[:n] + "…"
+    
+    candidates_for_prompt = [
+        {
+            "code": r[code_col],
+            "description": _short(r[desc_col], 360),
+            **({"rank": r[rank_col]} if rank_col and rank_col in m.columns else {})
+        }
+        for _, r in m.iterrows()
+    ]
+    
+    # Updated system message with weighted formula
+    system_msg = (
+        "You are an expert auto warranty claim adjudicator using SCS data. "
+        "Score each candidate loss code on a scale of 0.0 to 1.0 using this EXACT formula:\n"
+        "1. **MASTER_DESC vs. CLAIM (Weight: 0.5):** Does the master description semantically match the collective evidence from CAUSE, CORRECTION, and PART_DESC/PART_NO?\n"
+        "   - 1.0 = Perfect match on key terms (e.g., 'fuel pump', 'engine stalling', 'replaced turbocharger').\n"
+        "   - 0.5 = Partial/generic match (e.g., 'electrical component' vs. 'blower motor').\n"
+        "   - 0.0 = No match.\n"
+        "2. **PART_NO & PART_DESC Specificity (Weight: 0.3):** Does the master description specifically mention the part number (PART_NO) or the exact part description (PART_DESC)?\n"
+        "3. **CAUSE/CORRECTION Specificity (Weight: 0.2):** Does the master description align with the described failure mode (CAUSE) or repair action (CORRECTION)?\n"
+        "Combine these weighted factors for the final score. "
+        "Return a structured JSON that includes a score 0–1, a terse 1-line justification per candidate, "
+        "and the final decision."
+    )
+    
+    # Build user message with markdown table
+    rank_header = ("\n(Candidates include PRIOR_RANK where 1 = best/most likely. "
+                  "Use this as a prior and tie-breaker.)") if rank_col and rank_col in m.columns else ""
+    
+    candidate_table = "| Code | Description" + (" | Rank |" if rank_col and rank_col in m.columns else "|") + "\n"
+    candidate_table += "|------|-------------" + ("|------|" if rank_col and rank_col in m.columns else "|") + "\n"
+    for c in candidates_for_prompt:
+        row_text = f"| {c['code']} | {c['description']} "
+        if rank_col and rank_col in m.columns and 'rank' in c:
+            row_text += f"| {c['rank']} |"
+        else:
+            row_text += "|"
+        candidate_table += row_text + "\n"
+    
+    user_msg = {
+        "role": "user",
+        "content": (
+            f"## CLAIM DATA\n"
+            f"- **PART_NO:** {part_no}\n"
+            f"- **CAUSE:** {cause}\n"
+            f"- **CORRECTION:** {correction}\n"
+            f"- **PART_DESC:** {part_desc}\n\n"
+            f"## CANDIDATE LOSS CODES\n"
+            f"{candidate_table}\n"
+            f"{rank_header}\n\n"
+            "## INSTRUCTIONS\n"
+            "1. Analyze each candidate against the claim data using the weighted formula.\n"
+            "2. For EACH candidate, produce a numeric score in [0,1].\n"
+            "3. Keep justification to <= 25 words; cite exact words that match.\n"
+            "4. Choose the single best code.\n"
+            "5. new_loss_code MUST be one of the candidate codes.\n"
+        )
+    }
+    
+    # Schema (unchanged)
+    schema = {
+        "name": "LossCodeDecision",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "per_candidate": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "code": {"type": "string", "enum": candidate_codes},
+                            "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "justification": {"type": "string", "maxLength": 140}
+                        },
+                        "required": ["code", "score", "justification"]
+                    }
+                },
+                "new_loss_code": {"type": "string", "enum": candidate_codes},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "action": {"type": "string", "enum": ["apply", "keep_old", "needs_review"]},
+                "rationale": {"type": "string", "maxLength": 200},
+                "evidence_fields": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["CAUSE", "CORRECTION", "PART_DESC", "MASTER_DESC"]}
+                }
+            },
+            "required": ["per_candidate", "new_loss_code", "confidence", "action", "rationale", "evidence_fields"]
+        },
+        "strict": True
+    }
+    
+    # Call the model
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                user_msg
+            ],
+            temperature=0.0,
+            response_format={"type": "json_schema", "json_schema": schema}
+        )
+        content = resp.choices[0].message.content
+        data = pd.json.loads(content) if hasattr(pd, "json") else __import__("json").loads(content)
+        
+        return {
+            "claim_id": claim_id,
+            "job_no": job_no,
+            "old_loss_code": old_code,
+            "candidates_available": True,
+            "llm_response": data,
+            "claim_data": {  # Include cleaned claim data for analysis
+                "PART_NO": part_no,
+                "CAUSE": cause,
+                "CORRECTION": correction,
+                "PART_DESC": part_desc
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "claim_id": claim_id,
+            "job_no": job_no,
+            "old_loss_code": old_code,
+            "candidates_available": True,
+            "llm_response": None,
+            "error": str(e)
+        }
+
+
+
+
+
+# Collect detailed data for analysis
+detailed_results = []
+
+for r in sample_rows:
+    r = r.asDict()
+    
+    row_for_llm = {
+        "claim_id": r["iclaim_id"],
+        "sjob_no": r["sjob_no"],
+        "loss_code": r.get("initial_loss_code"),
+        "CAUSE": r.get("CAUSE", "") or "",
+        "CORRECTION": r.get("CORRECTION", "") or "",
+        "part_description": r.get("initial_part_desc", "") or "",
+        "spart_no": r.get("spart_no", "") or ""  # Added for cleaning
+    }
+    
+    cands_pd = cands_pd_all[
+        (cands_pd_all["spart_no"] == r["spart_no"]) &
+        (cands_pd_all["snapshot_date_str"] == str(r["snapshot_date"]))
+    ]
+    
+    if cands_pd.empty:
+        continue
+        
+    candidate_codes = cands_pd["sloss_code"].tolist()
+    
+    # Get detailed response
+    detailed_data = adjudicate_loss_code_llm_detailed(
+        row=row_for_llm,
+        candidate_codes=candidate_codes,
+        loss_code_master=cands_pd,
+        code_col="sloss_code",
+        desc_col="sdetail_desc",
+        part_desc_col_in_row="part_description",
+        rank_col='rank_in_part'
+    )
+    
+    # Add the true final code for validation
+    detailed_data["true_final_code"] = r.get("final_loss_code")
+    detailed_data["spart_no"] = r["spart_no"]
+    detailed_data["snapshot_date"] = str(r["snapshot_date"])
+    
+    detailed_results.append(detailed_data)
+    time.sleep(0.5)  # Respect rate limits
+
+# Convert to DataFrame for analysis
+analysis_df = pd.DataFrame(detailed_results)
+
+
+def expand_llm_response_for_analysis(df):
+    """Expands the LLM response into a flat structure for analysis"""
+    expanded_rows = []
+    
+    for _, row in df.iterrows():
+        if not row['llm_response'] or not row['candidates_available']:
+            continue
+            
+        claim_data = row['claim_data']
+        llm_data = row['llm_response']
+        
+        base_info = {
+            'claim_id': row['claim_id'],
+            'job_no': row['job_no'],
+            'old_loss_code': row['old_loss_code'],
+            'true_final_code': row['true_final_code'],
+            'spart_no': row['spart_no'],
+            'snapshot_date': row['snapshot_date'],
+            'PART_NO': claim_data['PART_NO'],
+            'CAUSE': claim_data['CAUSE'],
+            'CORRECTION': claim_data['CORRECTION'],
+            'PART_DESC': claim_data['PART_DESC'],
+            'llm_chosen_code': llm_data['new_loss_code'],
+            'llm_confidence': llm_data['confidence'],
+            'llm_action': llm_data['action'],
+            'llm_rationale': llm_data['rationale'],
+            'correct_prediction': (str(llm_data['new_loss_code']) == str(row['true_final_code']))
+        }
+        
+        # Add per-candidate scores
+        for candidate in llm_data['per_candidate']:
+            candidate_row = base_info.copy()
+            candidate_row.update({
+                'candidate_code': candidate['code'],
+                'candidate_score': candidate['score'],
+                'candidate_justification': candidate['justification'],
+                'is_chosen_candidate': (candidate['code'] == llm_data['new_loss_code'])
+            })
+            expanded_rows.append(candidate_row)
+    
+    return pd.DataFrame(expanded_rows)
+
+# Create your experimentation dataset
+experiment_df = expand_llm_response_for_analysis(analysis_df)
+
+# Save for analysis
+experiment_df.to_csv('llm_adjudication_experiment_data.csv', index=False)
+print(f"Created dataset with {len(experiment_df)} candidate evaluations")
