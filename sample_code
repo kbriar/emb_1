@@ -1,0 +1,231 @@
+def _as_list(x):
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        # try JSON array first
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
+        # try comma/space separated
+        if "," in s:
+            return [t.strip() for t in s.split(",") if t.strip()]
+        # space separated as fallback
+        return [t for t in s.split() if t]
+    return []
+
+#----------   2. Prepare DSPY dataset ---------------------------- 
+
+def prepare_dspy_dataset(historical_df: pd.DataFrame,
+                        loss_code_master: pd.DataFrame,
+                        num_examples: int = 100,
+                        code_col: str = "sloss_code",
+                        desc_col: str = "sdetail_desc"
+                        ) -> List[dspy.Example]:
+    
+    print(f"Preparing {num_examples} examples from {len(historical_df)} historical records...")
+
+    # Step 1: Apply the original filter for 60%
+    filt = (
+        (historical_df.get('loss_code_changed_adj', pd.Series([False] * len(historical_df))) == True) &
+        (historical_df['correct_loss_code_in_candidates'] == True) &
+        (historical_df['final_loss_code_adj'].notnull())
+    )
+
+    filtered_df = historical_df[filt].copy()
+    num_filtered = int(num_examples * 0.6)  # 60% of requested examples
+    num_filtered = min(num_filtered, len(filtered_df))  # Don't oversample
+    num_random = num_examples - num_filtered
+
+    # Sample 60% (or as many as available if fewer)
+    train_df_filtered = filtered_df.sample(n=num_filtered, random_state=42) if num_filtered > 0 else pd.DataFrame()
+    print(f"Num sampled : {num_filtered}, Num random : {num_random}")
+
+    # Step 2: Sample remaining 40% randomly from all data, excluding already selected
+    remaining_df = historical_df.drop(train_df_filtered.index) if not train_df_filtered.empty else historical_df
+    num_random = num_examples - len(train_df_filtered)  # Adjust if filtered_df was smaller
+    train_df_random = remaining_df.sample(n=min(num_random, len(remaining_df)), random_state=42) if num_random > 0 else pd.DataFrame()
+
+    # Combine the two DataFrames
+    train_df = pd.concat([train_df_filtered, train_df_random], ignore_index=True)
+
+    # Ensure we don't exceed num_examples
+    train_df = train_df.sample(n=min(num_examples, len(train_df)), random_state=42) if len(train_df) > num_examples else train_df
+
+    # Build a MASTER_DESC map (choose most frequent desc per code if duplicates)
+    master_map = (
+        loss_code_master[[code_col, desc_col]]
+        .dropna()
+        .groupby(code_col)[desc_col]
+        .agg(lambda s: s.value_counts().index[0])  # most frequent as canonical
+        .to_dict()
+    )
+
+    examples = []
+    skipped_empty_candidates = 0
+
+    for _, row in train_df.iterrows():
+        # FIXED: Properly handle candidate_codes extraction
+        candidate_codes_raw = row.get('candidate_codes', [])
+        candidate_codes = _as_list(candidate_codes_raw)
+        
+        # Skip examples with empty candidate lists
+        if not candidate_codes:
+            skipped_empty_candidates += 1
+            continue
+
+        per_code_rank = row.get('per_code_rank', {})  # e.g., dict code->rank; else None
+
+        # --- NEW: context fields used by the objective ---
+        old_loss_code = str(row.get('old_loss_code') or row.get('initial_loss_code') or "")
+        true_code = str(row['final_loss_code_adj'])
+        final_denied = bool(row.get('final_status_id') == 3)
+        adj_updated = bool(row.get('loss_code_changed_adj') or row.get('loss_code_changed') or False)
+        cand_has_true = _candidates_contains_true(candidate_codes, true_code)
+
+        # plan flags if you have them (optional)
+        new_in_plan = row.get('new_loss_code_in_plan', None)
+        final_in_plan = row.get('final_loss_code_in_plan', None)
+
+        # Build candidate table with MASTER_DESC
+        has_rank = any((isinstance(per_code_rank, dict) and c in per_code_rank) for c in candidate_codes)
+        header = "| Code | MASTER_DESC" + (" | Rank |" if has_rank else " |")
+        sep = "|------|------------" + ("|------|" if has_rank else "|")
+        lines = [header, sep]
+
+        for code in candidate_codes:
+            md = master_map.get(code, f"Desc for {code}")
+            if has_rank:
+                rk = per_code_rank.get(code, "")
+                lines.append(f"| {code} | {md} | {rk} |")
+            else:
+                lines.append(f"| {code} | {md} |")
+
+        candidate_table = "\n".join(lines)
+
+        def clean(s): return re.sub(r"\s+", " ", str(s or "")).strip()
+
+        make = clean(row.get('make'))
+        part_no = clean(row.get('spart_no'))
+        cause = clean(row.get('CAUSE'))
+        correction = clean(row.get('CORRECTION'))
+        part_desc = clean(row.get('part_description'))
+
+        example = dspy.Example(
+            claim_make=make,
+            part_no=part_no,
+            cause=cause,
+            correction=correction,
+            part_desc=part_desc,
+            claim_summary=_mk_claim_summary(make, part_no, part_desc, cause, correction),
+            candidate_codes_table=candidate_table,
+            per_candidate_scores="[]",
+            new_loss_code=str(row['final_loss_code_adj']),
+            confidence=1.0,
+            action="apply",
+            rationale="Human adjudicated change.",
+            evidence_fields="CAUSE,CORRECTION,PART_DESC,MASTER_DESC",
+            # --- NEW: context for objective ---
+            target_code=true_code,
+            target_action="apply",
+            old_loss_code=old_loss_code,
+            adj_updated=adj_updated,
+            final_denied=final_denied,
+            new_loss_code_in_plan=new_in_plan,
+            final_loss_code_in_plan=final_in_plan,
+            candidates_contains_true=cand_has_true,
+        ).with_inputs('claim_make','part_no','cause','correction','part_desc','claim_summary','candidate_codes_table')
+
+        examples.append(example)
+
+    print(f"Filtered rows: {len(filtered_df)}")
+    print(f"Train filtered rows: {len(train_df_filtered)}")
+    print(f"Random rows: {len(train_df_random)}")
+    print(f"Total train rows: {len(train_df)}")
+    print(f"Examples created: {len(examples)}")
+    print(f"Skipped {skipped_empty_candidates} examples with empty candidate codes")
+    
+    return examples
+
+
+
+#----------   3. candidates contains true ---------------------------- 
+def _candidates_contains_true(candidate_codes, true_code):
+    if true_code is None or not candidate_codes:
+        return False
+    try:
+        true_code_str = str(true_code).strip()
+        candidate_strs = [str(c).strip() for c in candidate_codes]
+        return true_code_str in candidate_strs
+    except Exception:
+        return False
+
+#-------------- 4. parse candidate table ----------------------------------
+def parse_candidate_table(table_text):
+    """Robust parsing of candidate code table for debugging"""
+    if not table_text or not isinstance(table_text, str):
+        return []
+    
+    candidates = []
+    lines = table_text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        # Skip header lines, separators, and empty lines
+        if (not line or 
+            line.startswith('|--') or 
+            line.startswith('Code') or 
+            line.startswith('---') or
+            'MASTER_DESC' in line):
+            continue
+            
+        # Extract code from markdown table row
+        parts = [p.strip() for p in line.split('|') if p.strip()]
+        if len(parts) >= 2:  # At least code and description
+            code = parts[0]
+            if code and code not in candidates:
+                candidates.append(code)
+    
+    return candidates
+
+
+# -------------------------- 5. enhanced training validation -------------------------------------------------
+def optimize_adjudicator(train_examples: List[dspy.Example], val_size: int = 10):    
+    # Filter out examples with empty or invalid candidate tables
+    valid_train_examples = []
+    invalid_count = 0
+    
+    for i, example in enumerate(train_examples):
+        try:
+            # Parse candidate_codes_table to check if it's valid
+            cands = parse_candidate_table(example.candidate_codes_table)
+            if not cands:
+                invalid_count += 1
+                continue
+                
+            valid_train_examples.append(example)
+            
+        except Exception as e:
+            invalid_count += 1
+            continue
+    
+    print(f"Filtered {invalid_count} invalid examples (empty candidate tables)")
+    print(f"Training with {len(valid_train_examples)} valid examples")
+    
+    if not valid_train_examples:
+        raise ValueError("No valid training examples with candidate codes available")
+    
+    train_set = valid_train_examples[val_size:]
+    val_set = valid_train_examples[:val_size]
+
+    print(f"Train set size: {len(train_set)}, Val set size: {len(val_set)}")
+
+    # Use _objective_wrapper for bootstrapping
+    teleprompter = BootstrapFewShot(metric=_objective_wrapper, max_bootstrapped_demos=20, max_labeled_demos=20)
+    optimized_adjudicator = teleprompter.compile(LossCodeAdjudicator(), trainset=train_set)
+
+    # ... rest of your training code ...
