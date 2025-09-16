@@ -1,0 +1,320 @@
+You're right to be concerned about performance. The enhanced corrective action processing can indeed be more computationally intensive, especially with the additional text processing and potential multiple embedding lookups. Let me help you optimize this code for better performance.
+Performance Optimization Strategies
+1. Batch Processing for Corrective Actions
+python
+
+def _prep_corrective_embeddings(
+    self,
+    parts_df: pd.DataFrame,
+    corrective_action_col: str = "corrective_action",
+    part_id_col: str = "spart_no",
+    part_text_col: str = "spart_desc",
+):
+    """
+    Optimized corrective action embedding preparation with batch processing.
+    """
+    def _normalize(v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float32)
+        n = np.linalg.norm(v)
+        return (v / n) if n > 0 else v
+
+    # Precompute all relevant actions in a batch
+    relevant_actions = []
+    valid_indices = []
+    
+    for i in range(len(parts_df)):
+        corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+        part_desc = parts_df.iloc[i][part_text_col]
+        
+        if corrective_action and not pd.isna(corrective_action) and str(corrective_action).strip():
+            relevant_action = self._extract_relevant_corrective_action(corrective_action, part_desc)
+            if relevant_action:
+                relevant_actions.append(relevant_action)
+                valid_indices.append(i)
+
+    if not relevant_actions:
+        return None, None, None
+
+    # Get all embeddings in a single batch
+    embs = self.corrective_cache.get_batch_embeddings(relevant_actions, self.model)
+    
+    # Process results
+    corrective_idx_keep = []
+    corrective_vecs = []
+    corrective_texts = []
+    
+    for i, emb in enumerate(embs):
+        if emb is not None:
+            corrective_idx_keep.append(valid_indices[i])
+            corrective_vecs.append(_normalize(emb))
+            corrective_texts.append(relevant_actions[i])
+
+    if not corrective_vecs:
+        return None, None, None
+
+    corrective_mat = np.stack(corrective_vecs).astype(np.float32)
+    return corrective_mat, corrective_idx_keep, corrective_texts
+
+2. Optimized Text Extraction
+python
+
+def _extract_relevant_corrective_action(self, corrective_action: str, part_desc: str) -> str:
+    """
+    Optimized method to extract relevant parts of corrective action.
+    """
+    if not corrective_action or pd.isna(corrective_action):
+        return ""
+        
+    corrective_action = str(corrective_action).lower()
+    part_desc = str(part_desc).lower()
+    
+    # Early return if the corrective action is short
+    if len(corrective_action) < 100:
+        return corrective_action
+    
+    # Use faster string operations instead of regex where possible
+    part_words = set(part_desc.split())
+    
+    # Look for sentences containing part-related words
+    sentences = [s.strip() for s in corrective_action.split('.') if s.strip()]
+    relevant_sentences = []
+    
+    for sentence in sentences:
+        sentence_words = set(sentence.split())
+        if part_words & sentence_words:  # Check for any common words
+            relevant_sentences.append(sentence)
+    
+    if relevant_sentences:
+        return ". ".join(relevant_sentences)
+    
+    # Fallback: return first 200 characters if no specific match found
+    return corrective_action[:200] + ("..." if len(corrective_action) > 200 else "")
+
+3. Add Performance Monitoring
+python
+
+import time
+from functools import wraps
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f'Function {func.__name__} took {total_time:.4f} seconds')
+        return result
+    return timeit_wrapper
+
+# Decorate key functions
+@timeit
+def _prep_corrective_embeddings(self, parts_df, corrective_action_col="corrective_action", 
+                               part_id_col="spart_no", part_text_col="spart_desc"):
+    # implementation
+    pass
+
+@timeit
+def _prep_embeddings(self, loss_df, parts_df, loss_id_col="sloss_code_icomponent_id",
+                    loss_text_col="sdetail_desc_scomponent_desc", part_id_col="spart_no",
+                    part_text_col="spart_desc"):
+    # implementation
+    pass
+
+4. Implement Caching for Text Processing
+python
+
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)
+def _extract_relevant_corrective_action_cached(self, corrective_action: str, part_desc: str) -> str:
+    """
+    Cached version of the text extraction function.
+    """
+    return self._extract_relevant_corrective_action(corrective_action, part_desc)
+
+# Use the cached version in your processing
+def _prep_corrective_embeddings(self, parts_df, ...):
+    # ...
+    relevant_action = self._extract_relevant_corrective_action_cached(corrective_action, part_desc)
+    # ...
+
+5. Add Progress Tracking
+python
+
+from tqdm import tqdm
+
+def _prep_corrective_embeddings(self, parts_df, ...):
+    # ...
+    relevant_actions = []
+    valid_indices = []
+    
+    # Add progress bar
+    for i in tqdm(range(len(parts_df)), desc="Processing corrective actions"):
+        corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+        part_desc = parts_df.iloc[i][part_text_col]
+        
+        if corrective_action and not pd.isna(corrective_action) and str(corrective_action).strip():
+            relevant_action = self._extract_relevant_corrective_action(corrective_action, part_desc)
+            if relevant_action:
+                relevant_actions.append(relevant_action)
+                valid_indices.append(i)
+    # ...
+
+6. Implement Early Termination for Large Datasets
+python
+
+def _prep_corrective_embeddings(self, parts_df, ...):
+    # If dataset is too large, process only a sample
+    max_samples = 1000  # Adjust based on your needs
+    if len(parts_df) > max_samples:
+        print(f"Dataset too large ({len(parts_df)} rows). Sampling {max_samples} rows for corrective action processing.")
+        parts_df = parts_df.sample(n=max_samples, random_state=42)
+    
+    # Rest of the processing
+    # ...
+
+Final Implementation
+
+Here's the optimized version combining these strategies:
+python
+
+import time
+from functools import wraps, lru_cache
+from tqdm import tqdm
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f'Function {func.__name__} took {total_time:.4f} seconds')
+        return result
+    return timeit_wrapper
+
+class SimilarityCalculator:
+    # ... other methods ...
+    
+    @timeit
+    def _prep_corrective_embeddings(
+        self,
+        parts_df: pd.DataFrame,
+        corrective_action_col: str = "corrective_action",
+        part_id_col: str = "spart_no",
+        part_text_col: str = "spart_desc",
+    ):
+        """
+        Optimized corrective action embedding preparation with batch processing.
+        """
+        def _normalize(v: np.ndarray) -> np.ndarray:
+            v = np.asarray(v, dtype=np.float32)
+            n = np.linalg.norm(v)
+            return (v / n) if n > 0 else v
+
+        # If dataset is too large, process only a sample
+        max_samples = 1000
+        if len(parts_df) > max_samples:
+            print(f"Dataset too large ({len(parts_df)} rows). Sampling {max_samples} rows for corrective action processing.")
+            parts_df = parts_df.sample(n=max_samples, random_state=42)
+
+        # Precompute all relevant actions in a batch
+        relevant_actions = []
+        valid_indices = []
+        
+        for i in tqdm(range(len(parts_df)), desc="Processing corrective actions"):
+            corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+            part_desc = parts_df.iloc[i][part_text_col]
+            
+            if corrective_action and not pd.isna(corrective_action) and str(corrective_action).strip():
+                relevant_action = self._extract_relevant_corrective_action_cached(corrective_action, part_desc)
+                if relevant_action:
+                    relevant_actions.append(relevant_action)
+                    valid_indices.append(i)
+
+        if not relevant_actions:
+            return None, None, None
+
+        # Get all embeddings in a single batch
+        embs = self.corrective_cache.get_batch_embeddings(relevant_actions, self.model)
+        
+        # Process results
+        corrective_idx_keep = []
+        corrective_vecs = []
+        corrective_texts = []
+        
+        for i, emb in enumerate(embs):
+            if emb is not None:
+                corrective_idx_keep.append(valid_indices[i])
+                corrective_vecs.append(_normalize(emb))
+                corrective_texts.append(relevant_actions[i])
+
+        if not corrective_vecs:
+            return None, None, None
+
+        corrective_mat = np.stack(corrective_vecs).astype(np.float32)
+        return corrective_mat, corrective_idx_keep, corrective_texts
+
+    @lru_cache(maxsize=1000)
+    def _extract_relevant_corrective_action_cached(self, corrective_action: str, part_desc: str) -> str:
+        """
+        Cached version of the text extraction function.
+        """
+        return self._extract_relevant_corrective_action(corrective_action, part_desc)
+
+    def _extract_relevant_corrective_action(self, corrective_action: str, part_desc: str) -> str:
+        """
+        Optimized method to extract relevant parts of corrective action.
+        """
+        if not corrective_action or pd.isna(corrective_action):
+            return ""
+            
+        corrective_action = str(corrective_action).lower()
+        part_desc = str(part_desc).lower()
+        
+        # Early return if the corrective action is short
+        if len(corrective_action) < 100:
+            return corrective_action
+        
+        # Use faster string operations instead of regex where possible
+        part_words = set(part_desc.split())
+        
+        # Look for sentences containing part-related words
+        sentences = [s.strip() for s in corrective_action.split('.') if s.strip()]
+        relevant_sentences = []
+        
+        for sentence in sentences:
+            sentence_words = set(sentence.split())
+            if part_words & sentence_words:  # Check for any common words
+                relevant_sentences.append(sentence)
+        
+        if relevant_sentences:
+            return ". ".join(relevant_sentences)
+        
+        # Fallback: return first 200 characters if no specific match found
+        return corrective_action[:200] + ("..." if len(corrective_action) > 200 else "")
+
+These optimizations should significantly improve performance:
+
+    Batch processing reduces API calls
+
+    Caching avoids redundant text processing
+
+    Simplified text extraction uses faster operations
+
+    Progress tracking helps identify bottlenecks
+
+    Sampling for very large datasets prevents excessive processing
+
+If performance is still an issue after these changes, you might want to consider:
+
+    Using a faster embedding model if available
+
+    Implementing parallel processing for large batches
+
+    Precomputing and storing embeddings for common corrective actions
+
+    Adding more aggressive caching strategies
+
+Let me know if you need further optimizations!
