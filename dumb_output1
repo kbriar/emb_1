@@ -1115,5 +1115,49 @@ final_pd_llm2[["correct_loss_code_in_candidates", "clcic_reason"]] = (
 )
 final_pd_llm2["correct_loss_code_in_candidates"] = final_pd_llm2["correct_loss_code_in_candidates"].astype("boolean")
 
+# ----------------- Spark section: unchanged logic -----------------
+if final_pd_llm.empty:
+    print("No results produced.")
+else:
+    final_spark_llm_2_llm = spark.createDataFrame(final_pd_llm2)
+    final_spark_llm_2_llm =  (final_spark_llm_2_llm
+                          .withColumn('new_loss_code_org', F.col('new_loss_code'))
+                          # You can keep your 0.8 rule OR key off 'action' directly
+                          .withColumn('new_loss_code', 
+                                      F.when((F.col("action").isin(['needs_review', None])) & 
+                                             (F.col('confidence') < 0.8), F.col('old_loss_code'))  # still your rule
+                                       .otherwise(F.col('new_loss_code')))
+                          .withColumn('correct_changed_loss_code',
+                                      F.when(F.col('new_loss_code') ==  F.col('final_loss_code_adj'), True).otherwise(False))
+                         )
 
+    final_spark_llm_2_llm = (flag_loss_code_in_plan(final_spark_llm_2_llm, scs_plan_component, "new_loss_code", normalize=True, broadcast_plan=True)
+                         .withColumnRenamed("loss_code_in_plan", "new_loss_code_in_plan") 
+                         .withColumn('final_loss_code', F.col('final_loss_code_adj'))
+    )
+
+    final_spark_llm_2_llm = flag_loss_code_in_plan(final_spark_llm_2_llm, scs_plan_component, "final_loss_code", normalize=True, broadcast_plan=True)\
+                        .withColumnRenamed("loss_code_in_plan", "final_loss_code_in_plan")
+
+    display(final_spark_llm_2_llm)
+
+    save_path_llm_ouput2 = f"/Volumes/cat_gsfsind_acr_dev/base/ingest/Workings/akoppu/llm_ouput_{start_date_str}_{end_date_str}_{llm_end}_12_9_v1_dspy"
+    print(f"Saving to {save_path_llm_ouput}")
+    final_spark_llm_2_llm.write.mode("overwrite").parquet(f"{save_path_llm_ouput}")
+
+
+summarize_loss_code_metrics(final_spark_llm_2).display()
+
+
+metric	count
+Total rows	100
+Adj updated	42
+Adj updated and denied	10
+Denied due to loss code not covered	9
+Denied due to other reason	1
+AAE updated	59
+AAE updated overlap with adj	31
+AAE updated overlap with adj and equals final	16
+AAE updated and denied (new not covered)	10
+AAE, Adj updated and denied	6
 
