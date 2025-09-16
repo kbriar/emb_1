@@ -1,36 +1,114 @@
-def business_metric(ex, pred, trace=None, **_):
-    # 1) exact match reward
-    gt_code = (str(ex.get("target_code","")) or "").strip().lower()
-    pr_code = (str(getattr(pred, "new_loss_code", "") or "")).strip().lower()
-    base = 1.0 if gt_code and pr_code and gt_code == pr_code else 0.0
+1. Update the AdjudicateLossCode Signature
+python
 
-    # 2) decode predicted action
-    action = (getattr(pred, "action", "") or "").strip().lower()  # apply | keep_old | needs_review
+class AdjudicateLossCode(dspy.Signature):
+    """You are an expert auto warranty claim adjudicator using SCS data.
 
-    # 3) business context
-    final_denied = bool(ex.get("final_denied", False))
-    adj_updated  = bool(ex.get("adj_updated", False))
-    cand_has_true = bool(ex.get("candidates_contains_true", True))
+    Score each candidate loss code on a scale of 0.0 to 1.0 using this EXACT formula:
+    1. MASTER_DESC vs CLAIM (0.3)
+    2. PART_NO + MAKE via external knowledge (0.1): Use well-established public domain knowledge
+       about OEM/aftermarket part numbering and brand associations (e.g., common prefixes, catalog conventions).
+       If you cannot confidently link the PART_NO to a MAKE, assign 0 for this factor and state 'insufficient external evidence'.
+       Do not invent a MAKE.
+    3. PART_DESC specificity (0.25)
+    4. CORRECTION specificity (0.2)
+    5. CAUSE specificity (0.15)
 
-    penalty = 0.0
+    Use the provided CLAIM SUMMARY line to align fields against the rubric.
+    Combine factors for the final score. Keep justification <= 25 words citing exact matched terms.
+    Also, score the old_loss_code using the same formula.
 
-    # Heavily penalize "updated and denied (new not covered)" events
-    if action == "apply" and final_denied and (not cand_has_true):
-        penalty += 2.0  # increased penalty to strongly push away from this outcome
+    Choose the best action from: apply, keep_old, needs_review.
+    - Apply: if the best candidate score is significantly higher (>=0.15) than the old_loss_code score and confidence is high.
+    - Keep_old: if the best candidate score is not significantly higher (<0.15) than the old_loss_code score.
+    - Needs_review: if the best candidate score is below threshold (0.8) or no clear winner.
 
-    # Penalize "AAE, Adj updated and denied", but less (you asked to keep this same)
-    if action == "apply" and final_denied and adj_updated:
-        penalty += 0.25
+    Return per-candidate scores, final choice, confidence, action, rationale, and evidence fields."""
 
-    # Light general penalty when we apply but are wrong (encourages abstain/keep_old)
-    if action == "apply" and base == 0.0:
-        penalty += 0.15
+    claim_make: str = dspy.InputField(desc="The make of the vehicle.")
+    part_no: str = dspy.InputField(desc="The part number.")
+    cause: str = dspy.InputField(desc="The cause description.")
+    correction: str = dspy.InputField(desc="The correction description.")
+    part_desc: str = dspy.InputField(desc="The part description.")
+    claim_summary: str = dspy.InputField(desc="Single-line summary: MAKE | PART_NO | PART_DESC | CAUSE | CORRECTION.")
+    candidate_codes_table: str = dspy.InputField(desc="Markdown table of candidate codes with MASTER_DESC and optional ranks.")
+    old_loss_code: str = dspy.InputField(desc="The current loss code that needs to be adjudicated.")
 
-    # Slight reward for abstaining (needs_review) on risky cases:
-    abstain_bonus = 0.0
-    if action == "needs_review" and final_denied and (not cand_has_true):
-        abstain_bonus += 0.10
+    per_candidate_scores: str = dspy.OutputField(desc="JSON array of per-candidate {code, score, justification<=140 chars}.")
+    new_loss_code: str = dspy.OutputField(desc="The selected best loss code from candidates; if keep_old, return the old_loss_code.")
+    confidence: float = dspy.OutputField(desc="Confidence score in [0.0, 1.0].")
+    action: str = dspy.OutputField(desc="One of: apply, keep_old, needs_review.")
+    rationale: str = dspy.OutputField(desc="Brief rationale (<=200 chars).")
+    evidence_fields: str = dspy.OutputField(desc="Comma-separated list from: CAUSE, CORRECTION, PART_DESC, MASTER_DESC.")
 
-    # Compose score (clip to [0,1])
-    score = max(0.0, min(1.0, base - penalty + abstain_bonus))
-    return score
+2. Update prepare_dspy_dataset to Include old_loss_code as Input
+
+In the prepare_dspy_dataset function, when creating the dspy.Example, add old_loss_code to the inputs:
+python
+
+        example = dspy.Example(
+            claim_make=make,
+            part_no=part_no,
+            cause=cause,
+            correction=correction,
+            part_desc=part_desc,
+            claim_summary=_mk_claim_summary(make, part_no, part_desc, cause, correction),
+            candidate_codes_table=candidate_table,
+            per_candidate_scores="[]",
+            new_loss_code=str(row['final_loss_code_adj']),
+            confidence=1.0,
+            action="apply",
+            rationale="Human adjudicated change.",
+            evidence_fields="CAUSE,CORRECTION,PART_DESC,MASTER_DESC",
+            # --- NEW: context for objective ---
+            target_code=true_code,
+            target_action="apply",
+            old_loss_code=old_loss_code,
+            adj_updated=adj_updated,
+            final_denied=final_denied,
+            new_loss_code_in_plan=new_in_plan,
+            final_loss_code_in_plan=final_in_plan,
+            candidates_contains_true=cand_has_true,
+        ).with_inputs('claim_make','part_no','cause','correction','part_desc','claim_summary','candidate_codes_table','old_loss_code')  # Add 'old_loss_code' here
+
+3. Update adjudicate_loss_code_dspy to Pass old_loss_code
+
+In the adjudicate_loss_code_dspy function, ensure old_code is correctly extracted and passed to the adjudicator:
+python
+
+    # Extract old_code correctly
+    old_code = str(row.get("loss_code") or row.get("sloss_code") or "")  # Fix the extraction
+
+    # ... [existing code] ...
+
+    if not candidates_exist:
+        # ... [existing code] ...
+
+    try:
+        claim_summary = _mk_claim_summary(make, part_no, part_desc, cause, correction)
+        pred = optimized_adjudicator(
+            claim_make=make or "",
+            part_no=part_no,
+            cause=cause,
+            correction=correction,
+            part_desc=part_desc,
+            claim_summary=claim_summary,
+            candidate_codes_table=candidate_table,
+            old_loss_code=old_code,  # Add this argument
+        )
+    except Exception as e:
+        # ... [existing code] ...
+
+Explanation:
+
+    Signature Update: The AdjudicateLossCode now includes old_loss_code as an input and provides explicit instructions on when to choose keep_old based on score comparison.
+
+    Example Inputs: The with_inputs method now includes old_loss_code to ensure it is passed during training and inference.
+
+    Function Call: The adjudicate_loss_code_dspy function now passes old_code to the adjudicator, enabling the model to compare candidates with the old code.
+
+Next Steps:
+
+After making these changes, re-run the optimization process (e.g., optimize_adjudicator function) to train the model with the new signature. This should help the model learn to prefer keep_old when improvements are marginal, reducing unnecessary changes and improving alignment with human adjudicators.
+
+If you continue to see issues, consider further tuning the business metric or adding more specific rewards for keep_old in the objective functions. Let me know if you need assistance with those adjustments!
