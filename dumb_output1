@@ -1,15 +1,3 @@
-import dspy
-from dspy.teleprompt import BootstrapFewShot
-from dspy.evaluate import Evaluate
-import pandas as pd
-import json
-import re
-from typing import Dict, List, Any
-
-# Set up DSPy with OpenAI (replace with your API key and model)
-openai_lm = dspy.LM(model='gpt-4o', api_key=os.environ['OPENAI_API_KEY'], temperature=0.0, max_tokens=2000)
-dspy.configure(lm=openai_lm)
-
 import json, re
 import pandas as pd
 from typing import List
@@ -67,24 +55,6 @@ def exact_match_metric(example, pred, trace=None, **_):
     return 1.0 if gt and pr and gt == pr else 0.0
 
 
-
-def _as_list(x):
-    if isinstance(x, list):
-        return x
-    if isinstance(x, str):
-        s = x.strip()
-        # try JSON array
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                return json.loads(s)
-            except Exception:
-                pass
-        # comma/space separated fallback
-        return [t for t in re.split(r"[,\s]+", s) if t]
-    return []
-
-
-
 def _mk_claim_summary(make: str, part_no: str, part_desc: str, cause: str, correction: str) -> str:
     """Combine claim fields into a concise summary."""
     parts = [f"Make: {make}" if make else None,
@@ -94,26 +64,27 @@ def _mk_claim_summary(make: str, part_no: str, part_desc: str, cause: str, corre
              f"Correction: {correction}" if correction else None]
     return "; ".join(p for p in parts if p)
 
-
-
 def prepare_dspy_dataset(historical_df: pd.DataFrame,
-                         loss_code_master: pd.DataFrame,
-                         num_examples: int = 100,
-                         code_col: str = "sloss_code",
-                         desc_col: str = "sdetail_desc"
-                         ) -> List[dspy.Example]:
+                        loss_code_master: pd.DataFrame,
+                        num_examples: int = 100,
+                        code_col: str = "sloss_code",
+                        desc_col: str = "sdetail_desc"
+                        ) -> List[dspy.Example]:
+    
     print(f"Preparing {num_examples} examples from {len(historical_df)} historical records...")
+
     # Step 1: Apply the original filter for 60%
     filt = (
         (historical_df.get('loss_code_changed_adj', pd.Series([False] * len(historical_df))) == True) &
         (historical_df['correct_loss_code_in_candidates'] == True) &
         (historical_df['final_loss_code_adj'].notnull())
     )
-    filtered_df = historical_df[filt].copy()
 
+    filtered_df = historical_df[filt].copy()
     num_filtered = int(num_examples * 0.6)  # 60% of requested examples
     num_filtered = min(num_filtered, len(filtered_df))  # Don't oversample
     num_random = num_examples - num_filtered
+
     # Sample 60% (or as many as available if fewer)
     train_df_filtered = filtered_df.sample(n=num_filtered, random_state=42) if num_filtered > 0 else pd.DataFrame()
     print(f"Num sampled : {num_filtered}, Num random : {num_random}")
@@ -129,39 +100,48 @@ def prepare_dspy_dataset(historical_df: pd.DataFrame,
     # Ensure we don't exceed num_examples
     train_df = train_df.sample(n=min(num_examples, len(train_df)), random_state=42) if len(train_df) > num_examples else train_df
 
-    # train_df = train_df.sample(min(num_examples, len(train_df)), random_state=42)
-
     # Build a MASTER_DESC map (choose most frequent desc per code if duplicates)
     master_map = (
         loss_code_master[[code_col, desc_col]]
         .dropna()
         .groupby(code_col)[desc_col]
-        .agg(lambda s: s.value_counts().index[0])   # most frequent as canonical
+        .agg(lambda s: s.value_counts().index[0])  # most frequent as canonical
         .to_dict()
     )
 
     examples = []
+    skipped_empty_candidates = 0
+
     for _, row in train_df.iterrows():
-        candidate_codes = _as_list(row['candidate_codes'])
-        # per-code rank if available (column name you store per row per code list; fallback None)
+        # FIXED: Properly handle candidate_codes extraction
+        candidate_codes_raw = row.get('candidate_codes', [])
+        print(f"candidate_codes_raw: {candidate_codes_raw}, type: {type(candidate_codes_raw)}")
+        candidate_codes = _as_list(candidate_codes_raw)
+        
+        # Skip examples with empty candidate lists
+        if not candidate_codes:
+            skipped_empty_candidates += 1
+            continue
+
         per_code_rank = row.get('per_code_rank', {})  # e.g., dict code->rank; else None
 
         # --- NEW: context fields used by the objective ---
-        old_loss_code   = str(row.get('old_loss_code') or row.get('initial_loss_code') or "")
-        true_code       = str(row['final_loss_code_adj'])
-        final_denied    = bool(row.get('final_status_id') == 3)
-        adj_updated     = bool(row.get('loss_code_changed_adj') or row.get('loss_code_changed') or False)
-        cand_has_true   = _candidates_contains_true(candidate_codes, true_code)
+        old_loss_code = str(row.get('old_loss_code') or row.get('initial_loss_code') or "")
+        true_code = str(row['final_loss_code_adj'])
+        final_denied = bool(row.get('final_status_id') == 3)
+        adj_updated = bool(row.get('loss_code_changed_adj') or row.get('loss_code_changed') or False)
+        cand_has_true = _candidates_contains_true(candidate_codes, true_code)
 
         # plan flags if you have them (optional)
-        new_in_plan   = row.get('new_loss_code_in_plan', None)
+        new_in_plan = row.get('new_loss_code_in_plan', None)
         final_in_plan = row.get('final_loss_code_in_plan', None)
 
         # Build candidate table with MASTER_DESC
         has_rank = any((isinstance(per_code_rank, dict) and c in per_code_rank) for c in candidate_codes)
         header = "| Code | MASTER_DESC" + (" | Rank |" if has_rank else " |")
-        sep    = "|------|-------------" + ("|------|" if has_rank else "|")
-        lines  = [header, sep]
+        sep = "|------|------------" + ("|------|" if has_rank else "|")
+        lines = [header, sep]
+
         for code in candidate_codes:
             md = master_map.get(code, f"Desc for {code}")
             if has_rank:
@@ -169,15 +149,16 @@ def prepare_dspy_dataset(historical_df: pd.DataFrame,
                 lines.append(f"| {code} | {md} | {rk} |")
             else:
                 lines.append(f"| {code} | {md} |")
+
         candidate_table = "\n".join(lines)
 
         def clean(s): return re.sub(r"\s+", " ", str(s or "")).strip()
+
         make = clean(row.get('make'))
         part_no = clean(row.get('spart_no'))
         cause = clean(row.get('CAUSE'))
         correction = clean(row.get('CORRECTION'))
         part_desc = clean(row.get('part_description'))
-        # print(f"claim_summary: {_mk_claim_summary(make, part_no, part_desc, cause, correction)}")
 
         example = dspy.Example(
             claim_make=make,
@@ -193,7 +174,7 @@ def prepare_dspy_dataset(historical_df: pd.DataFrame,
             action="apply",
             rationale="Human adjudicated change.",
             evidence_fields="CAUSE,CORRECTION,PART_DESC,MASTER_DESC",
- # --- NEW: context for objective ---
+            # --- NEW: context for objective ---
             target_code=true_code,
             target_action="apply",
             old_loss_code=old_loss_code,
@@ -204,7 +185,6 @@ def prepare_dspy_dataset(historical_df: pd.DataFrame,
             candidates_contains_true=cand_has_true,
         ).with_inputs('claim_make','part_no','cause','correction','part_desc','claim_summary','candidate_codes_table')
 
-
         examples.append(example)
 
     print(f"Filtered rows: {len(filtered_df)}")
@@ -212,8 +192,9 @@ def prepare_dspy_dataset(historical_df: pd.DataFrame,
     print(f"Random rows: {len(train_df_random)}")
     print(f"Total train rows: {len(train_df)}")
     print(f"Examples created: {len(examples)}")
+    print(f"Skipped {skipped_empty_candidates} examples with empty candidate codes")
+    
     return examples
-
 
 
 def _json_or_list(x):
@@ -243,12 +224,15 @@ def _per_dict(per_list):
     return out
 
 def _candidates_contains_true(candidate_codes, true_code):
-    if true_code is None:
+    if true_code is None or not candidate_codes:
         return False
     try:
-        return str(true_code) in [str(c) for c in (candidate_codes or [])]
+        true_code_str = str(true_code).strip()
+        candidate_strs = [str(c).strip() for c in candidate_codes]
+        return true_code_str in candidate_strs
     except Exception:
         return False
+
 
 
 REVIEW_THRESHOLD = 0.80  # if top candidate score < threshold => action="needs_review"
@@ -509,208 +493,6 @@ def adjudicate_loss_code_dspy(
         "rank_map": rank_map,
     }
 
-from pyspark.sql import functions as F, Window
-
-# ------------------------------------------------------------
-# 1) Prepare dimensions
-# ------------------------------------------------------------
-def prep_claims_dim(claim_details):
-    """
-    Build 'claims' dimension: distinct (loss_code, desc, iclaim_detail_id) for Parts.
-    """
-    claims = (
-        claim_details
-        .filter(F.col("sdetail_type").isin("P"))
-        .filter(F.col("sloss_code").isNotNull() & (F.trim(F.col("sloss_code")) != ""))
-        .select(
-            F.trim(F.col("sloss_code")).alias("sloss_code"),
-            "sdetail_desc",
-            F.col("idetail_id").alias("iclaim_detail_id"),
-        )
-        .distinct()
-    )
-    return claims
-
-
-# ------------------------------------------------------------
-# 2) Prepare parts streams (non-denied & denied)
-# ------------------------------------------------------------
-def prep_parts_streams(scs_claim_parts, rank_start_ts):
-    """
-    Build two part streams filtered to Parts (P), after RANK_START:
-    - cl_parts: non-denied (iclaim_det_status_id != 3)
-    - cl_parts_denied: denied only (iclaim_det_status_id == 3)
-    """
-    base = (
-        scs_claim_parts
-        .filter(F.col("dtlast_record_maintenance") >= F.to_timestamp(F.lit(rank_start_ts)))
-        .filter(F.col("sdetail_type").isin("P"))
-        .withColumn("spart_no", F.upper(F.regexp_replace("spart_no", "[^a-zA-Z0-9]", "")))
-        .select("iclaim_id", "spart_no", "iclaim_detail_id", "dtlast_record_maintenance")
-        .filter(F.col("spart_no").isNotNull() & (F.col("spart_no") != ""))
-    )
-
-    cl_parts = base.filter(F.col("iclaim_det_status_id") != 3) if "iclaim_det_status_id" in scs_claim_parts.columns \
-        else scs_claim_parts.filter(F.lit(False))  # defensive if column missing
-
-    cl_parts_denied = (
-        scs_claim_parts
-        .filter(F.col("dtlast_record_maintenance") >= F.to_timestamp(F.lit(rank_start_ts)))
-        .filter(F.col("sdetail_type").isin("P"))
-        .filter(F.col("iclaim_det_status_id") == 3)   # equality fix
-        .withColumn("spart_no", F.upper(F.regexp_replace("spart_no", "[^a-zA-Z0-9]", "")))
-        .select("iclaim_id", "spart_no", "iclaim_detail_id", "dtlast_record_maintenance")
-        .filter(F.col("spart_no").isNotNull() & (F.col("spart_no") != ""))
-    )
-
-    return cl_parts, cl_parts_denied
-
-
-# ------------------------------------------------------------
-# 3) Daily aggregates + snapshots
-# ------------------------------------------------------------
-def build_daily_counts_and_snapshots(claims, cl_parts, cl_parts_denied, result_equal_creq):
-    """
-    Produces:
-      - daily_distinct: distinct claim counts per (spart_no, sloss_code, dt_date) for NON-denied
-      - daily_all: daily totals per (spart_no, dt_date) split into non_denied / denied / total
-      - snapshots: distinct (spart_no, snapshot_date) from initial/final dates
-    """
-    # Non-denied daily distinct by loss code
-    claim_part_loss_time = (
-        cl_parts.join(claims, ["iclaim_detail_id"], "inner")
-                .withColumn("dt_date", F.to_date("dtlast_record_maintenance"))
-                .select("spart_no", F.trim(F.col("sloss_code")).alias("sloss_code"), "dt_date", "iclaim_id")
-                .cache()
-    )
-
-    daily_distinct = (
-        claim_part_loss_time
-        .groupBy("spart_no", "sloss_code", "dt_date")
-        .agg(F.countDistinct("iclaim_id").alias("daily_distinct_claims"))
-    )
-
-    # Denied daily
-    claim_part_time_denied = (
-        cl_parts_denied.join(claims, ["iclaim_detail_id"], "inner")
-                       .withColumn("dt_date", F.to_date("dtlast_record_maintenance"))
-                       .select("spart_no", "dt_date", "iclaim_id")
-    )
-    daily_denied = (
-        claim_part_time_denied
-        .groupBy("spart_no", "dt_date")
-        .agg(F.countDistinct("iclaim_id").alias("daily_denied_claims"))
-    )
-
-    # Collapse non-denied across loss codes to (spart_no, dt_date)
-    daily_non_denied = (
-        daily_distinct
-        .groupBy("spart_no", "dt_date")
-        .agg(F.sum("daily_distinct_claims").alias("daily_non_denied_claims"))
-    )
-
-    # Join to build daily_all
-    daily_all = (
-        daily_non_denied.join(daily_denied, ["spart_no", "dt_date"], "full_outer")
-        .select(
-            "spart_no", "dt_date",
-            F.coalesce(F.col("daily_non_denied_claims"), F.lit(0)).alias("daily_non_denied_claims"),
-            F.coalesce(F.col("daily_denied_claims"), F.lit(0)).alias("daily_denied_claims"),
-        )
-        .withColumn("daily_total_claims", F.col("daily_non_denied_claims") + F.col("daily_denied_claims"))
-    )
-
-    # Snapshot dates from result_equal_creq (both initial & final)
-    snapshots = (
-        result_equal_creq
-        .withColumn("snapshot_date", F.date_sub(F.to_date("final_dt"), 1))
-        .select("spart_no", "snapshot_date").distinct()
-        .union(
-            result_equal_creq
-            .withColumn("snapshot_date", F.date_sub(F.to_date("initial_dt"), 1))
-            .select("spart_no", "snapshot_date").distinct()
-        )
-        .distinct()
-    )
-
-    return daily_distinct, daily_all, snapshots
-
-
-# ------------------------------------------------------------
-# 4) Rank loss codes + attach cumulative denied metrics
-# ------------------------------------------------------------
-# from pyspark.sql import functions as F, Window
-
-def compute_rank_with_denied(daily_distinct, daily_all, snapshots):
-    """
-    - cum_total_occurrences & occurrences_pct: NON-DENIED ONLY (from daily_distinct)
-    - total_claims_denied & total_claims_all & pct_claims_denied: BOTH (from daily_all)
-    """
-
-    # ---------- NON-DENIED ranking core ----------
-    # cumulative per loss_code up to snapshot
-    agg_non_denied = (
-        daily_distinct.join(snapshots, "spart_no", "inner")
-                      .filter(F.col("dt_date") <= F.col("snapshot_date"))
-                      .groupBy("spart_no", "snapshot_date", "sloss_code")
-                      .agg(F.sum("daily_distinct_claims").alias("cum_occurrences"))
-    )
-
-    # totals for non-denied (denominator)
-    totals_non_denied = (
-        agg_non_denied.groupBy("spart_no", "snapshot_date")
-                      .agg(F.sum("cum_occurrences").alias("cum_total_occurrences"))
-    )
-
-    # attach denominator and percentage (NON-DENIED ONLY)
-    rank_core = (
-        agg_non_denied.join(totals_non_denied, ["spart_no", "snapshot_date"], "inner")
-                      .withColumn(
-                          "occurrences_pct",
-                          F.when(F.col("cum_total_occurrences") > 0,
-                                 100.0 * F.col("cum_occurrences") / F.col("cum_total_occurrences"))
-                           .otherwise(F.lit(None).cast("double"))
-                      )
-    )
-
-    # rank within part & snapshot (same as before)
-    w = (Window.partitionBy("spart_no", "snapshot_date")
-                 .orderBy(F.col("cum_occurrences").desc(), F.col("sloss_code").asc()))
-    rank_core = rank_core.withColumn("rank_in_part", F.dense_rank().over(w))
-
-    # ---------- BOTH (denied + non-denied) for denied metrics ----------
-    cum_claims_all = (
-        daily_all.join(snapshots, "spart_no", "inner")
-                 .filter(F.col("dt_date") <= F.col("snapshot_date"))
-                 .groupBy("spart_no", "snapshot_date")
-                 .agg(
-                     F.sum("daily_denied_claims").alias("total_claims_denied"),
-                     F.sum("daily_total_claims").alias("total_claims_all"),
-                 )
-                 .withColumn(
-                     "pct_claims_denied",
-                     F.when(F.col("total_claims_all") > 0,
-                            100.0 * F.col("total_claims_denied") / F.col("total_claims_all"))
-                      .otherwise(F.lit(None).cast("double"))
-                 )
-    )
-
-    # ---------- Final frame ----------
-    rank_df = (
-        rank_core.join(cum_claims_all, ["spart_no", "snapshot_date"], "left")
-                 .select(
-                     "spart_no", "snapshot_date", "sloss_code",
-                     "cum_occurrences",                # non-denied
-                     "cum_total_occurrences",          # non-denied
-                     "occurrences_pct",                # non-denied
-                     "rank_in_part",
-                     "total_claims_denied",            # both
-                     "total_claims_all",               # both
-                     "pct_claims_denied"               # both
-                 )
-    )
-    return rank_df
-
 
 def my_objective(y_pred, y_true, row):
     """
@@ -825,17 +607,111 @@ def _objective_wrapper(example, pred, trace=None, **_):
     return float(my_objective(y_pred, y_true, row))
 
 
+def business_metric(ex, pred, trace=None, **_):
+    # 1) exact match reward
+    gt_code = (str(ex.get("target_code","")) or "").strip().lower()
+    pr_code = (str(getattr(pred, "new_loss_code", "") or "")).strip().lower()
+    base = 1.0 if gt_code and pr_code and gt_code == pr_code else 0.0
+
+    # 2) decode predicted action
+    action = (getattr(pred, "action", "") or "").strip().lower()  # apply | keep_old | needs_review
+
+    # 3) business context
+    final_denied = bool(ex.get("final_denied", False))
+    adj_updated  = bool(ex.get("adj_updated", False))
+    # proxy for "new not covered": true code is not present in candidates seen by the model
+    # (alternatively, add an explicit flag in your examples)
+    cand_has_true = bool(ex.get("candidates_contains_true", True))
+
+    penalty = 0.0
+
+    # Heavily penalize "updated and denied (new not covered)" events
+    # We proxy this as: model chooses to apply a (possibly wrong) new code
+    # when the ground-truth wasn't in candidates (risk of "new not covered"),
+    # and the claim gets denied.
+    if action == "apply" and final_denied and (not cand_has_true):
+        penalty += 0.75  # strong penalty to push away from this outcome
+
+    # Penalize "AAE, Adj updated and denied", but less (you asked to keep this same)
+    if action == "apply" and final_denied and adj_updated:
+        penalty += 0.25
+
+    # Light general penalty when we apply but are wrong (encourages abstain/keep_old)
+    if action == "apply" and base == 0.0:
+        penalty += 0.15
+
+    # Slight reward for abstaining (needs_review) on risky cases:
+    abstain_bonus = 0.0
+    if action == "needs_review" and final_denied and (not cand_has_true):
+        abstain_bonus += 0.10
+
+    # Compose score (clip to [0,1])
+    score = max(0.0, min(1.0, base - penalty + abstain_bonus))
+    return score
+
+
 from dspy.teleprompt import BootstrapFewShot
 from dspy.evaluate import Evaluate
 
-
-def optimize_adjudicator(train_examples: List[dspy.Example], val_size: int = 10):
-    train_set = train_examples[val_size:]
-    val_set = train_examples[:val_size]
-    print(f"Train set size: {len(train_set)}, Val set size: {len(val_set)}")
+def parse_candidate_table(table_text):
+    """Robust parsing of candidate code table for debugging"""
+    if not table_text or not isinstance(table_text, str):
+        return []
     
+    candidates = []
+    lines = table_text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        # Skip header lines, separators, and empty lines
+        if (not line or 
+            line.startswith('|--') or 
+            line.startswith('Code') or 
+            line.startswith('---') or
+            'MASTER_DESC' in line):
+            continue
+            
+        # Extract code from markdown table row
+        parts = [p.strip() for p in line.split('|') if p.strip()]
+        if len(parts) >= 2:  # At least code and description
+            code = parts[0]
+            if code and code not in candidates:
+                candidates.append(code)
+    
+    return candidates
+
+def optimize_adjudicator(train_examples: List[dspy.Example], val_size: int = 10):    
+    # Filter out examples with empty or invalid candidate tables
+    valid_train_examples = []
+    invalid_count = 0
+    
+    for i, example in enumerate(train_examples):
+        try:
+            # Parse candidate_codes_table to check if it's valid
+            cands = parse_candidate_table(example.candidate_codes_table)
+            if not cands:
+                invalid_count += 1
+                continue
+                
+            valid_train_examples.append(example)
+            
+        except Exception as e:
+            invalid_count += 1
+            continue
+    
+    print(f"Filtered {invalid_count} invalid examples (empty candidate tables)")
+    print(f"Training with {len(valid_train_examples)} valid examples")
+    
+    if not valid_train_examples:
+        raise ValueError("No valid training examples with candidate codes available")
+    
+    train_set = valid_train_examples[val_size:]
+    val_set = valid_train_examples[:val_size]
+
+    print(f"Train set size: {len(train_set)}, Val set size: {len(val_set)}")
+
     # Use _objective_wrapper for bootstrapping
-    teleprompter = BootstrapFewShot(metric=_objective_wrapper, max_bootstrapped_demos=20, max_labeled_demos=20)
+    teleprompter = BootstrapFewShot(metric=business_metric, max_bootstrapped_demos=100, max_labeled_demos=100)
     optimized_adjudicator = teleprompter.compile(LossCodeAdjudicator(), trainset=train_set)
     
     # Debug bootstrapping: Inspect candidate_codes_table and raw outputs
@@ -856,7 +732,7 @@ def optimize_adjudicator(train_examples: List[dspy.Example], val_size: int = 10)
                 claim_summary=example.claim_summary,
                 candidate_codes_table=example.candidate_codes_table
             )
-            score = _objective_wrapper(example, pred)
+            score = business_metric(example, pred)
             print(f"Train example {i}: Succeeded, Predicted={pred.new_loss_code}, True={example.new_loss_code}, "
                   f"Score={score}, Action={pred.action}, Confidence={pred.confidence}, "
                   f"In candidates={pred.new_loss_code in cands if pred.new_loss_code else False}, "
@@ -865,7 +741,7 @@ def optimize_adjudicator(train_examples: List[dspy.Example], val_size: int = 10)
             print(f"Train example {i}: Failed: {str(e)}, Candidate_table={example.candidate_codes_table}")
     
     # Evaluate with _objective_wrapper
-    evaluate = Evaluate(devset=val_set, metric=_objective_wrapper, num_threads=4, display_progress=True)
+    evaluate = Evaluate(devset=val_set, metric=business_metric, num_threads=4, display_progress=True)
     score = evaluate(optimized_adjudicator)
     for i, example in enumerate(val_set):
         try:
@@ -884,7 +760,7 @@ def optimize_adjudicator(train_examples: List[dspy.Example], val_size: int = 10)
                 claim_summary=example.claim_summary,
                 candidate_codes_table=example.candidate_codes_table
             )
-            val_score = _objective_wrapper(example, pred)
+            val_score = business_metric(example, pred)
             print(f"Val example {i}: True={example.new_loss_code}, Pred={pred.new_loss_code}, Score={val_score}, "
                   f"Action={pred.action}, Confidence={pred.confidence}, "
                   f"In candidates={pred.new_loss_code in cands if pred.new_loss_code else False}, "
@@ -936,15 +812,25 @@ def _norm(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
 def _as_list(x):
-    if isinstance(x, list): return x
+    if isinstance(x, list):
+        return x
+    if isinstance(x, np.ndarray):
+        return x.tolist()
     if isinstance(x, str):
-        x = x.strip()
-        if x.startswith("[") and x.endswith("]"):
-            try: 
-                v = json.loads(x); 
-                return v if isinstance(v, list) else []
-            except Exception: pass
-        return [t for t in re.split(r"[,;\s]+", x) if t]
+        s = x.strip()
+        # try JSON array first
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
+        # try comma/space separated
+        if "," in s:
+            return [t.strip() for t in s.split(",") if t.strip()]
+        # space separated as fallback
+        return [t for t in s.split() if t]
     return []
 
 def clean_and_balance_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1010,13 +896,224 @@ def clean_and_balance_df(df: pd.DataFrame) -> pd.DataFrame:
 
 train_examples = prepare_dspy_dataset(
     historical_df=prev_final_df2,
-    loss_code_master=cands_pd,          # or your master df
+    loss_code_master=cands_pd_all,  
+    # cands_pd_all=   cands_pd_all,     # or your master df
     num_examples=min(50, len(prev_final_df2))
 )
-print(f"Prepared {len(train_examples)} cleaned examples")
 
-optimized_model, eval_result = optimize_adjudicator(train_examples)
+optimised_model = optimize_adjudicator(train_examples)
 
+
+# --- imports you already have ---
+import re, json, numpy as np, pandas as pd, time
+from typing import Dict, Any, List
+
+# If you set this elsewhere, keep it in one place
+REVIEW_THRESHOLD = 0.80
+
+results_pd = []
+
+for r in sample_rows[:200]:
+    r = r.asDict()
+
+    row_for_llm = {
+        "claim_id": r["iclaim_id"],
+        "sjob_no": r["sjob_no"],
+        "loss_code": r.get("initial_loss_code"),
+        "CAUSE": r.get("CAUSE", "") or "",
+        "CORRECTION": r.get("CORRECTION", "") or "",
+        "part_description": r.get("initial_part_desc", "") or "",
+        "spart_no": r.get("spart_no", "") or "",
+        "make": r.get("make", "") or "",
+    }
+
+    cands_pd = cands_pd_all[
+        (cands_pd_all["spart_no"] == r["spart_no"]) &
+        (cands_pd_all["snapshot_date_str"] == str(r["snapshot_date"]))
+    ]
+
+    # 1) no-candidate row (keeps all your requested trace columns)
+    if cands_pd.empty:
+        results_pd.append(pd.DataFrame([{
+            "claim_id": r["iclaim_id"],
+            "job_no": r["sjob_no"],
+            "old_loss_code": r.get("initial_loss_code"),
+            "new_loss_code": None,
+            "new_loss_code_desc": None,
+            "changed": False,
+            "confidence": 0.0,
+            "action": "no_candidates",
+            "rationale": f"No candidates for spart_no={r['spart_no']} on {r['snapshot_date']}",
+            "evidence_fields": "",
+            "spart_no": r["spart_no"],
+            "snapshot_date": str(r["snapshot_date"]),
+            "creq_total": float(r["creq_total"]) if r["creq_total"] is not None else None,
+            "CAUSE": row_for_llm["CAUSE"],
+            "CORRECTION": row_for_llm["CORRECTION"],
+            "part_description": row_for_llm["part_description"],
+            "final_loss_code_adj": r.get("final_loss_code"),
+            "final_detail_desc_adj": r.get("final_detail_desc"),
+            "final_status_id": r.get("final_status_id"),
+            "loss_code_changed_adj": r.get("loss_code_changed"),
+            "correct_changed_loss_code": False,
+            "correct_loss_code_in_candidates": False,
+            "iplan_id": r.get("iplan_id"),
+            "similarity_score": None,
+            "embedding_source": None,
+            "prior_rank": None,
+            "candidate_codes": [],
+            "per_candidate_json": "[]",
+        }]))
+        continue
+
+    candidate_codes = cands_pd["sloss_code"].tolist()
+
+    # 2) call the adjudicator  <<< CHANGED (now DSPy wrapper)
+    det = adjudicate_loss_code_dspy(                            # <<< CHANGED
+        row=row_for_llm,
+        candidate_codes=candidate_codes,
+        loss_code_master=cands_pd,                              # (same slice you used before)
+        optimized_adjudicator=optimised_model,            # <<< CHANGED (pass the DSPy module)
+        code_col="sloss_code",
+        desc_col="sdetail_desc",
+        part_desc_col_in_row="part_description",
+        rank_col="rank_in_part",
+    )
+
+    # if model errored or missing response (defensive)
+    if not det or not det.get("llm_response"):
+        results_pd.append(pd.DataFrame([{
+            "claim_id": r["iclaim_id"],
+            "job_no": r["sjob_no"],
+            "old_loss_code": r.get("initial_loss_code"),
+            "new_loss_code": None,
+            "new_loss_code_desc": None,
+            "changed": False,
+            "confidence": 0.0,
+            "action": "error",
+            "rationale": det.get("error", "LLM error") if isinstance(det, dict) else "LLM error",
+            "evidence_fields": "",
+            "spart_no": r["spart_no"],
+            "snapshot_date": str(r["snapshot_date"]),
+            "creq_total": float(r["creq_total"]) if r["creq_total"] is not None else None,
+            "CAUSE": row_for_llm["CAUSE"],
+            "CORRECTION": row_for_llm["CORRECTION"],
+            "part_description": row_for_llm["part_description"],
+            "final_loss_code_adj": r.get("final_loss_code"),
+            "final_detail_desc_adj": r.get("final_detail_desc"),
+            "final_status_id": r.get("final_status_id"),
+            "loss_code_changed_adj": r.get("loss_code_changed"),
+            "correct_changed_loss_code": False,
+            "correct_loss_code_in_candidates": (str(r.get("final_loss_code")) in candidate_codes),
+            "iplan_id": r.get("iplan_id"),
+            "similarity_score": None,
+            "embedding_source": None,
+            "prior_rank": None,
+            "candidate_codes": candidate_codes,
+            "per_candidate_json": "[]",
+        }]))
+        continue
+
+    # 3) enrich chosen with maps (same as before)
+    llm = det["llm_response"]
+    new_code  = llm.get("new_loss_code")
+    desc_map  = det.get("desc_map", {})
+    sim_map   = det.get("sim_scr_map", {})
+    emb_map   = det.get("emb_scr_map", {})
+    rank_map  = det.get("rank_map", {})
+
+    new_desc   = desc_map.get(new_code)
+    sim_scr    = sim_map.get(new_code, None)
+    emb_src    = emb_map.get(new_code, None)
+    prior_rank = rank_map.get(new_code, None)
+
+    final_code = str(r.get("final_loss_code"))
+    correct_changed = (str(new_code) == final_code)
+    correct_in_cands = (final_code is not None and final_code in candidate_codes)
+
+    # 4) assemble final row (unchanged fields/titles)
+    out = pd.DataFrame([{
+        "claim_id": r["iclaim_id"],
+        "job_no": r["sjob_no"],
+        "old_loss_code": r.get("initial_loss_code"),
+        "new_loss_code": new_code,
+        "new_loss_code_desc": new_desc,
+        "changed": (str(new_code) != str(r.get("initial_loss_code"))),
+        "confidence": float(llm.get("confidence", 0.0)),
+        "action": llm.get("action"),
+        "rationale": llm.get("rationale"),
+        "evidence_fields": ",".join(llm.get("evidence_fields", [])),
+        "spart_no": r["spart_no"],
+        "snapshot_date": str(r["snapshot_date"]),
+        "creq_total": float(r["creq_total"]) if r["creq_total"] is not None else None,
+        "CAUSE": row_for_llm["CAUSE"],
+        "CORRECTION": row_for_llm["CORRECTION"],
+        "part_description": row_for_llm["part_description"],
+        "final_loss_code_adj": r.get("final_loss_code"),
+        "final_detail_desc_adj": r.get("final_detail_desc"),
+        "final_status_id": r.get("final_status_id"),
+        "loss_code_changed_adj": r.get("loss_code_changed"),
+        "iplan_id": r.get("iplan_id"),
+        "correct_changed_loss_code": correct_changed,
+        "correct_loss_code_in_candidates": correct_in_cands,
+        # trace columns
+        "similarity_score": sim_scr,
+        "embedding_source": emb_src,
+        "prior_rank": prior_rank,
+        "candidate_codes": det["candidate_codes"],
+        "per_candidate_json": json.dumps(llm.get("per_candidate", []), ensure_ascii=False),
+    }])
+
+    results_pd.append(out)
+    time.sleep(0.2)  # keep if you still need to rate-limit; otherwise drop
+
+final_pd_llm = pd.concat(results_pd, ignore_index=True) if results_pd else pd.DataFrame()
+
+# ----------------- your post-processing stays the same -----------------
+final_pd_llm2 = final_pd_llm.copy()
+
+def _canon(x):
+    return re.sub(r"\s+", "", str(x)).upper() if pd.notna(x) else None
+
+def _to_list_str(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)): return []
+    if isinstance(x, (list, tuple)): return [str(v) for v in x if v is not None and not (isinstance(v,float) and np.isnan(v))]
+    if isinstance(x, str):
+        s = x.strip()
+        if not s: return []
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list): return [str(v) for v in arr if v is not None]
+        except Exception:
+            return [i.strip() for i in s.split(",") if i.strip()]
+    if isinstance(x, (int, np.integer)): return [str(int(x))]
+    if isinstance(x, (float, np.floating)): return [] if np.isnan(x) else [str(x)]
+    return []
+
+final_pd_llm2["candidate_codes"] = final_pd_llm2["candidate_codes"].apply(_to_list_str)
+
+def _pick_code(row):
+    # priority: final -> new -> old (same as yours)
+    for col in ["final_loss_code_adj", "new_loss_code", "old_loss_code"]:
+        v = row.get(col)
+        if pd.notna(v) and str(v).strip():
+            return str(v)
+    return None
+
+def _compute_clcic(row):
+    code = _pick_code(row)
+    if not code:
+        return pd.NA, "no_final_code"
+    cands = row["candidate_codes"]
+    if not cands:
+        return pd.NA, "no_candidates"
+    res = _canon(code) in {_canon(x) for x in cands}
+    return bool(res), "computed"
+
+final_pd_llm2[["correct_loss_code_in_candidates", "clcic_reason"]] = (
+    final_pd_llm2.apply(lambda r: pd.Series(_compute_clcic(r)), axis=1)
+)
+final_pd_llm2["correct_loss_code_in_candidates"] = final_pd_llm2["correct_loss_code_in_candidates"].astype("boolean")
 
 
 
