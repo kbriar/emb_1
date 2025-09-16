@@ -1,0 +1,244 @@
+Based on the examples you've provided, I can see the core issue: the corrective action text often contains multiple repairs or issues, but the embedding system needs to focus only on the part that's relevant to the specific part being analyzed. Here are several strategies to improve the matching accuracy:
+1. Enhanced Text Preprocessing for Corrective Actions
+python
+
+def _extract_relevant_corrective_action(self, corrective_action: str, part_desc: str) -> str:
+    """
+    Enhanced method to extract the most relevant part of corrective action
+    that matches the part description using multiple strategies.
+    """
+    if not corrective_action or pd.isna(corrective_action):
+        return ""
+        
+    corrective_action = str(correction_action).lower()
+    part_desc = str(part_desc).lower()
+    
+    # Strategy 1: Look for part description words with context
+    part_words = set(re.findall(r'\w+', part_desc))
+    
+    # Strategy 2: Use more sophisticated pattern matching
+    # Common repair patterns to look for
+    repair_patterns = [
+        r'replace\s+([^,.]+)',  # "replace X"
+        r'r&r\s+([^,.]+)',      # "R&R X"
+        r'install\s+([^,.]+)',  # "install X"
+        r'new\s+([^,.]+)',      # "new X"
+        r'repair\s+([^,.]+)',   # "repair X"
+    ]
+    
+    # Strategy 3: Look for the part in common automotive terminology contexts
+    relevant_phrases = []
+    
+    # Check for exact part mentions
+    for pattern in repair_patterns:
+        matches = re.findall(pattern, corrective_action)
+        for match in matches:
+            # Check if this phrase contains part-related words
+            match_words = set(re.findall(r'\w+', match))
+            if part_words & match_words:  # Intersection of words
+                relevant_phrases.append(match.strip())
+    
+    # Strategy 4: Use semantic similarity to find the best match
+    if relevant_phrases:
+        # Get embeddings for all relevant phrases
+        phrase_embs = self.get_embeddings_batch(relevant_phrases)
+        part_emb = self.get_embeddings_batch([part_desc])[0]
+        
+        if part_emb is not None and all(emb is not None for emb in phrase_embs):
+            # Calculate cosine similarities
+            similarities = [np.dot(part_emb, emb) for emb in phrase_embs]
+            best_idx = np.argmax(similarities)
+            return relevant_phrases[best_idx]
+    
+    # Fallback: Use the original simple approach
+    part_words = set(re.findall(r'\w+', part_desc))
+    corrective_words = re.findall(r'\w+', corrective_action)
+    
+    # Find sentences or phrases containing part-related words
+    relevant_sentences = []
+    for sentence in re.split(r'[.!?]', corrective_action):
+        if any(word in sentence for word in part_words):
+            relevant_sentences.append(sentence.strip())
+    
+    if relevant_sentences:
+        return ". ".join(relevant_sentences)
+    
+    # Final fallback: return the full corrective action
+    return corrective_action
+
+2. Add Part-Specific Keyword Enhancement
+python
+
+def _enhance_part_context(self, part_desc: str) -> List[str]:
+    """
+    Expand part description with related terms and synonyms
+    to improve matching against corrective actions.
+    """
+    # Common automotive part synonyms and related terms
+    part_synonyms = {
+        'sensor': ['sensor', 'module', 'unit', 'transducer', 'detector'],
+        'module': ['module', 'control unit', 'ecu', 'computer', 'processor'],
+        'valve': ['valve', 'solenoid', 'actuator', 'control valve'],
+        'regulator': ['regulator', 'motor', 'actuator', 'control motor'],
+        'assy': ['assembly', 'assy', 'unit', 'module', 'component']
+    }
+    
+    enhanced_terms = set()
+    part_words = re.findall(r'\w+', part_desc.lower())
+    
+    for word in part_words:
+        enhanced_terms.add(word)
+        if word in part_synonyms:
+            enhanced_terms.update(part_synonyms[word])
+    
+    return list(enhanced_terms)
+
+3. Implement Multi-Stage Matching
+python
+
+def _prep_corrective_embeddings(
+    self,
+    parts_df: pd.DataFrame,
+    corrective_action_col: str = "corrective_action",
+    part_id_col: str = "spart_no",
+    part_text_col: str = "spart_desc",
+):
+    """
+    Enhanced corrective action embedding preparation with multi-stage matching.
+    """
+    def _normalize(v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float32)
+        n = np.linalg.norm(v)
+        return (v / n) if n > 0 else v
+
+    corrective_idx_keep, corrective_vecs = [], []
+    corrective_texts = []
+
+    for i in range(len(parts_df)):
+        corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+        part_desc = parts_df.iloc[i][part_text_col]
+        
+        if corrective_action and not pd.isna(correction_action) and str(correction_action).strip():
+            # Enhanced extraction with multiple strategies
+            relevant_action = self._extract_relevant_corrective_action(correction_action, part_desc)
+            
+            if relevant_action:
+                corrective_idx_keep.append(i)
+                corrective_texts.append(relevant_action)
+                
+                # Get embedding for the relevant action
+                emb = self.corrective_cache.get_embedding(relevant_action, self.model)
+                if emb is not None:
+                    corrective_vecs.append(_normalize(emb))
+                else:
+                    # If not in cache, we'll batch process later
+                    corrective_vecs.append(None)
+
+    # Batch process any missing embeddings
+    texts_to_fetch = [corrective_texts[i] for i, emb in enumerate(corrective_vecs) if emb is None]
+    if texts_to_fetch:
+        fetched_embs = self.corrective_cache.get_batch_embeddings(texts_to_fetch, self.model)
+        fetch_idx = 0
+        for i in range(len(corrective_vecs)):
+            if corrective_vecs[i] is None:
+                if fetch_idx < len(fetched_embs) and fetched_embs[fetch_idx] is not None:
+                    corrective_vecs[i] = _normalize(fetched_embs[fetch_idx])
+                fetch_idx += 1
+
+    # Remove any entries that still don't have embeddings
+    valid_indices = [i for i, emb in enumerate(corrective_vecs) if emb is not None]
+    corrective_idx_keep = [corrective_idx_keep[i] for i in valid_indices]
+    corrective_vecs = [corrective_vecs[i] for i in valid_indices]
+    corrective_texts = [corrective_texts[i] for i in valid_indices]
+
+    if not corrective_vecs:
+        return None, None, None
+
+    corrective_mat = np.stack(corrective_vecs).astype(np.float32)
+    return corrective_mat, corrective_idx_keep, corrective_texts
+
+4. Add Validation and Fallback Mechanism
+python
+
+def validate_corrective_matches(
+    self,
+    top_matches_corrective: pd.DataFrame,
+    parts_df: pd.DataFrame,
+    similarity_threshold: float = 0.7
+) -> pd.DataFrame:
+    """
+    Validate corrective action matches and filter low-confidence results.
+    """
+    if top_matches_corrective is None or top_matches_corrective.empty:
+        return pd.DataFrame()
+    
+    validated_matches = []
+    
+    for _, match in top_matches_corrective.iterrows():
+        part_no = match['spart_no']
+        part_desc = match['spart_desc']
+        similarity = match['similarity_score']
+        corrective_text = match['corrective_action_text']
+        
+        # Get the part's actual corrective action
+        part_row = parts_df[parts_df['spart_no'] == part_no]
+        if not part_row.empty:
+            actual_corrective = part_row.iloc[0]['corrective_action']
+            
+            # Additional validation: check if the match makes sense
+            is_valid = (
+                similarity >= similarity_threshold and
+                self._validate_match_context(part_desc, corrective_text, actual_corrective)
+            )
+            
+            if is_valid:
+                validated_matches.append(match)
+    
+    return pd.DataFrame(validated_matches)
+
+def _validate_match_context(self, part_desc: str, corrective_text: str, full_corrective: str) -> bool:
+    """
+    Validate that the match makes contextual sense.
+    """
+    # Check if the corrective text contains part-related terms
+    part_terms = self._enhance_part_context(part_desc)
+    corrective_words = set(re.findall(r'\w+', corrective_text.lower()))
+    
+    # At least one part-related term should be in the corrective text
+    return any(term in corrective_words for term in part_terms)
+
+5. Implementation in Main Function
+python
+
+def calculate_similarity_for_databricks(
+    # ... existing parameters ...
+):
+    # ... existing code ...
+    
+    if efficient:
+        print("Using efficient top-N...")
+        if use_both_sources and "corrective_action" in parts_df.columns:
+            print("Generating top matches from both part descriptions and corrective actions...")
+            top_matches_part, top_matches_corrective = calculator.get_top_n_matches_both_sources(
+                loss_df, parts_df, n=top_n, corrective_action_col="corrective_action"
+            )
+            
+            # Add validation step for corrective action matches
+            if top_matches_corrective is not None:
+                top_matches_corrective = calculator.validate_corrective_matches(
+                    top_matches_corrective, parts_df
+                )
+        else:
+            # ... rest of existing code ...
+
+These enhancements should significantly improve the accuracy of matching corrective actions to the right loss codes by:
+
+    Better text extraction from multi-issue corrective actions
+
+    Semantic matching that goes beyond simple keyword matching
+
+    Context validation to ensure matches make sense
+
+    Fallback mechanisms for when automatic extraction fails
+
+The system will now be better at handling cases like your examples where corrective actions mention multiple repairs but only one is relevant to the specific part.
