@@ -1,0 +1,168 @@
+# ... (previous imports and code remain the same until SimilarityCalculator class)
+
+class SimilarityCalculator:
+    def __init__(
+        self,
+        openai_api_key: str,
+        model: str = "text-embedding-3-small",
+        cache_path: str = BASE_DIR,
+        embedding_store_path: Optional[str] = None,
+    ):
+        self.model = model
+        self.client = OpenAI(api_key=openai_api_key)
+        self.cache = EmbeddingCache(os.path.join(cache_path, "my_embeddings_cache.json"), client=self.client)
+        # Only use embedding store for loss codes, not for parts or corrective actions
+        self.embedding_store_path = embedding_store_path
+        # Add corrective action cache
+        self.corrective_cache = EmbeddingCache(os.path.join(cache_path, "corrective_embeddings_cache.json"), client=self.client)
+
+    # ... (other methods remain the same until _prep_embeddings)
+
+    def _prep_embeddings(
+        self,
+        loss_df: pd.DataFrame,
+        parts_df: pd.DataFrame,
+        loss_id_col: str = "sloss_code_icomponent_id",
+        loss_text_col: str = "sdetail_desc_scomponent_desc",
+        part_id_col: str = "spart_no",
+        part_text_col: str = "spart_desc",
+    ):
+        """
+        Build L2-normalized embedding matrices (loss, part) aligned to the given DFs.
+        Always compute part embeddings fresh, don't load from storage.
+        """
+        def _normalize(v: np.ndarray) -> np.ndarray:
+            v = np.asarray(v, dtype=np.float32)
+            n = np.linalg.norm(v)
+            return (v / n) if n > 0 else v
+
+        use_store = bool(self.embedding_store_path)
+        loss_store = None
+
+        # --- Build LOSS side (still can use store) ---
+        loss_idx_keep, loss_vecs = [], []
+
+        if use_store:
+            # Try loading precomputed tables only for loss
+            loss_path = os.path.join(self.embedding_store_path, "loss_embeddings.parquet")
+            if os.path.exists(loss_path):
+                loss_store = pd.read_parquet(loss_path)
+
+        if loss_store is not None and not loss_store.empty:
+            loss_map = dict(
+                zip(loss_store[loss_id_col].astype(str), loss_store["embedding"])
+            )
+            for i, rid in enumerate(loss_df[loss_id_col].astype(str).tolist()):
+                emb = loss_map.get(rid)
+                if emb is not None:
+                    loss_idx_keep.append(i)
+                    loss_vecs.append(_normalize(np.array(emb, dtype=np.float32)))
+
+        if not loss_vecs:
+            loss_texts = loss_df[loss_text_col].fillna("").astype(str).tolist()
+            loss_embs = self.get_embeddings_batch(loss_texts)
+            for i, e in enumerate(loss_embs):
+                if e is not None:
+                    loss_idx_keep.append(i)
+                    loss_vecs.append(_normalize(e))
+
+        if not loss_vecs:
+            raise ValueError("No valid loss embeddings found.")
+
+        loss_mat = np.stack(loss_vecs).astype(np.float32)
+
+        # --- Build PART side (always compute fresh) ---
+        part_idx_keep, part_vecs = [], []
+        
+        # Always compute part embeddings from text, don't load from store
+        part_texts = parts_df[part_text_col].fillna("").astype(str).tolist()
+        part_embs = self.get_embeddings_batch(part_texts)
+        for i, e in enumerate(part_embs):
+            if e is not None:
+                part_idx_keep.append(i)
+                part_vecs.append(_normalize(e))
+
+        if not part_vecs:
+            raise ValueError("No valid part embeddings found.")
+
+        part_mat = np.stack(part_vecs).ast(np.float32)
+
+        return (loss_mat, loss_idx_keep), (part_mat, part_idx_keep)
+
+    def _prep_corrective_embeddings(
+        self,
+        parts_df: pd.DataFrame,
+        corrective_action_col: str = "corrective_action",
+        part_id_col: str = "spart_no",
+        part_text_col: str = "spart_desc",
+    ):
+        """
+        Prepare embeddings for corrective actions, always computing fresh.
+        """
+        def _normalize(v: np.ndarray) -> np.ndarray:
+            v = np.asarray(v, dtype=np.float32)
+            n = np.linalg.norm(v)
+            return (v / n) if n > 0 else v
+
+        # Always compute corrective embeddings fresh, don't load from store
+        corrective_idx_keep, corrective_vecs = [], []
+        corrective_texts = []
+
+        # Identify which parts have valid corrective actions
+        valid_parts_mask = []
+        for i in range(len(parts_df)):
+            corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+            if corrective_action and not pd.isna(corrective_action) and str(corrective_action).strip():
+                valid_parts_mask.append(True)
+            else:
+                valid_parts_mask.append(False)
+
+        # Always compute embeddings for valid parts
+        relevant_actions = []
+        for i in range(len(parts_df)):
+            if valid_parts_mask[i]:
+                part_desc = parts_df.iloc[i][part_text_col]
+                full_action = parts_df.iloc[i][corrective_action_col]
+                relevant_action = self._extract_relevant_corrective_action(full_action, part_desc)
+                relevant_actions.append(relevant_action)
+                corrective_texts.append(full_action)
+                corrective_idx_keep.append(i)
+
+        if not corrective_idx_keep:
+            return None, None, None
+
+        # Get embeddings for all relevant actions
+        embs = self.corrective_cache.get_batch_embeddings(relevant_actions, self.model)
+        
+        for i, e in enumerate(embs):
+            if e is not None:
+                corrective_vecs.append(_normalize(e))
+
+        if not corrective_vecs:
+            return None, None, None
+
+        corrective_mat = np.stack(corrective_vecs).ast(np.float32)
+        return corrective_mat, corrective_idx_keep, corrective_texts
+
+# ... (rest of the code remains the same until save_created_embeddings function)
+
+def save_created_embeddings(
+    loss_code_df,
+    part_only_his_fin_df,
+    calculator,
+    loss=False,
+    upsert_part=True,  # This parameter is now ignored
+    upsert_corrective=True,  # This parameter is now ignored
+    embedding_path="/Volumes/cat_gsfsind_acr_dev/base/ingest/Workings/akoppu/similarity_results",
+):
+    # Only save loss embeddings if requested
+    if loss:
+        loss_emb_df = build_loss_embeddings_df(loss_code_df, calculator)
+        loss_path = f"{embedding_path}/loss_embeddings.parquet"
+        print(f"Saving loss embeddings to {loss_path}")
+        loss_emb_df.to_parquet(loss_path, index=False)
+
+    # Skip saving part and corrective action embeddings as requested
+    print("Skipping part and corrective action embedding storage as requested")
+
+# ... (rest of the code remains the same)
