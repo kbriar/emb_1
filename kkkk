@@ -1,0 +1,1312 @@
+# LIB-----------------------------------------------------------------------------------------------------------
+
+def get_rank_missing_part_no(rank_df, filtered_claim_his_time_updt, rand_n):
+    
+    rank_df = (
+        rank_df
+        .withColumn("spart_no", F.upper(F.regexp_replace('spart_no', '[^a-zA-Z0-9]', '')))
+
+    )
+
+    claims_filtered_mini = (
+        filtered_claim_his_time_updt
+        .withColumn("spart_no", F.upper(F.regexp_replace('spart_no', '[^a-zA-Z0-9]', '')))
+        .select("iclaim_id", "spart_no", "sloss_code")
+        .distinct()
+        .join(rank_df, on = ["sloss_code", "spart_no"], how="leftanti")
+    )
+
+    claims_required_only_df = (
+        claims_filtered_mini
+        .orderBy(F.rand())  
+        .limit(rand_n)
+    )
+
+    rows = claims_required_only_df.collect()
+    spart_no_list = [r["spart_no"] for r in rows if r["spart_no"] is not None]
+
+    return claims_required_only_df, rows, spart_no_list
+
+def get_part_df_for_embeddings(scs_claim_parts, spart_no_list):
+
+    parts_only_his_df = (
+        scs_claim_parts
+        .filter(F.col("sdetail_type").isin("P"))
+        .withColumn("spart_no", F.upper(F.regexp_replace('spart_no', '[^a-zA-Z0-9]', '')))
+        .withColumn("spart_desc", F.lower(F.trim(F.col('spart_desc'))))
+        .withColumn(
+                "spart_desc",
+                F.trim(
+                    F.regexp_replace( F.regexp_replace(F.col("spart_desc"), r"[%=\+$]", " "),  # replace these with space
+                        r"\s+", " "                                              # normalize spaces
+                    )
+                )
+            )
+        .filter(F.col("spart_no").isNotNull() & (F.col("spart_no") != ""))
+        .filter(F.col("spart_desc").isNotNull() & (F.col("spart_desc") != ""))
+        .select("iclaim_id", "spart_no", "spart_desc")
+        .join(claims_filtered.select("iclaim_id").distinct(), 
+            on = "iclaim_id", how="inner")
+        .select( "spart_no", "spart_desc")
+        .distinct()
+        .filter(F.col('spart_no').isin(spart_no_list))
+    )
+
+    # Count frequency of each spart_no + spart_desc pair
+    counts2 = (
+        parts_only_his_df
+        .groupBy(F.trim(F.col("spart_no")).alias("spart_no"), "spart_desc")
+        .count()
+    )
+
+    # Window to rank spart_desc by frequency for each spart_no
+    w2 = Window.partitionBy("spart_no").orderBy(
+        F.col("count").desc(),
+        F.col("spart_desc").asc()  # tie-breaker alphabetically
+    )
+
+    # Pick the most frequent description per spart_no
+    parts_only_his_fin_df = (
+        counts2
+        .withColumn("rn", F.row_number().over(w2))
+        .filter(F.col("rn") == 1)
+        .drop("rn", "count")
+    )
+
+    return parts_only_his_fin_df
+
+def get_loss_df_for_embeddings(scs_loss_codes, scs_components):
+
+    loss_codes_df = scs_loss_codes.select("icomponent_id", "spart_desc", "sloss_code").join(scs_components.select('icomponent_id', 'scomponent_desc'), on = "icomponent_id", how="inner").distinct()
+
+    loss_codes_df_fin = (
+        loss_codes_df
+        .withColumn("sloss_code", F.trim(F.col("sloss_code")))
+        .withColumn("spart_desc", F.lower(F.trim(F.col("spart_desc"))))
+        .withColumn("scomponent_desc", F.lower(F.trim(F.col("scomponent_desc"))))
+        .filter(F.col("spart_desc").isNotNull() & (F.trim(F.col("spart_desc")) != ""))
+        .withColumnRenamed("spart_desc", "sdetail_desc")
+        .withColumn("sloss_code_icomponent_id", F.concat(F.col("sloss_code"), F.lit("_"), F.col("icomponent_id")))
+        .withColumn("sdetail_desc_scomponent_desc", F.concat(F.col("sdetail_desc"), F.lit("/"), F.col("scomponent_desc")))
+        .select("sloss_code_icomponent_id", "sdetail_desc_scomponent_desc")
+        .distinct()
+    )
+
+    return loss_codes_df_fin
+
+class EmbeddingCache:
+    def __init__(self, cache_file: str = CACHE_FILE, client: Optional[OpenAI] = None):
+        self.cache_file = cache_file
+        self.client = client
+        self.cache = self._load_cache()
+
+    def _load_cache(self) -> Dict:
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                return {}
+        return {}
+
+    def _save_cache(self):
+        try:
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            tmp = self.cache_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.cache, f)
+            os.replace(tmp, self.cache_file)  # atomic on POSIX
+        except Exception as e:
+            print(f"Error saving cache: {e}")
+
+    def _normalize_text(self, text: str) -> str:
+        if not text or pd.isna(text):
+            return ""
+        text = str(text)
+        text = unicodedata.normalize("NFC", text)
+        text = text.lower().strip()
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    def _get_text_hash(self, text: str, model: str) -> str:
+        """Generate unique hash for normalized text + model + version salt."""
+        normalized_text = self._normalize_text(text)
+        salt = f"v2_norm|{model}"  # bump if you change normalization/model
+        return hashlib.md5(f"{salt}|{normalized_text}".encode()).hexdigest()
+
+    def get_embedding(self, text: str, model: str = "text-embedding-3-small") -> Optional[np.ndarray]:
+        """Get embedding from cache only (no API)."""
+        if not text or pd.isna(text):
+            return None
+        text_hash = self._get_text_hash(text, model)
+        if text_hash in self.cache:
+            return np.array(self.cache[text_hash], dtype=np.float32)
+        return None
+
+    def get_batch_embeddings(self, texts: List[str], model: str = "text-embedding-3-small") -> List[Optional[np.ndarray]]:
+        """Get embeddings for a batch, using cache where available, API for misses."""
+        results: List[Optional[np.ndarray]] = []
+        texts_to_fetch: List[str] = []
+        idx_to_fetch: List[int] = []
+
+        for i, text in enumerate(texts):
+            if not text or pd.isna(text):
+                results.append(None)
+                continue
+            text_hash = self._get_text_hash(text, model)
+            if text_hash in self.cache:
+                results.append(np.array(self.cache[text_hash], dtype=np.float32))
+            else:
+                results.append(None)
+                texts_to_fetch.append(self._normalize_text(text))
+                idx_to_fetch.append(i)
+
+        if texts_to_fetch:
+            fetched = self._get_batch_embeddings_from_api(texts_to_fetch, model)
+            for out_idx, emb in zip(idx_to_fetch, fetched):
+                if emb is not None:
+                    v = np.array(emb, dtype=np.float32)
+                    n = np.linalg.norm(v)
+                    if n > 0:
+                        v /= n
+                    text_hash = self._get_text_hash(texts[out_idx], model)
+                    self.cache[text_hash] = v.tolist()
+                    results[out_idx] = v
+        self._save_cache()
+        return results
+
+    def _get_batch_embeddings_from_api(self, texts: List[str], model: str) -> List[Optional[np.ndarray]]:
+        """Fetch embeddings via OpenAI batch call (same order as inputs)."""
+        if not texts:
+            return []
+        try:
+            if self.client is None:
+                raise ValueError("OpenAI client not initialized")
+            backoff = 0.5
+            for attempt in range(5):
+                try:
+                    resp = self.client.embeddings.create(input=texts, model=model)
+                    return [np.array(d.embedding, dtype=np.float32) for d in resp.data]
+                except Exception:
+                    if attempt == 4:
+                        raise
+                    time.sleep(backoff)
+                    backoff *= 2
+        except Exception as e:
+            print(f"Error getting batch embeddings: {e}")
+            return [None] * len(texts)
+
+class SimilarityCalculator:
+    def __init__(
+        self,
+        openai_api_key: str,
+        model: str = "text-embedding-3-small",
+        cache_path: str = BASE_DIR,
+        embedding_store_path: Optional[str] = None,
+    ):
+        self.model = model
+        self.client = OpenAI(api_key=openai_api_key)
+        self.cache = EmbeddingCache(os.path.join(cache_path, "my_embeddings_cache.json"), client=self.client)
+        self.embedding_store_path = embedding_store_path
+        # Add corrective action cache
+        self.corrective_cache = EmbeddingCache(os.path.join(cache_path, "corrective_embeddings_cache.json"), client=self.client)
+
+    def _extract_relevant_corrective_action(self, corrective_action: str, part_desc: str) -> str:
+        """
+        Extract the part of corrective action that's most relevant to the part description.
+        """
+        if not corrective_action or pd.isna(corrective_action):
+            return ""
+            
+        corrective_action = str(corrective_action).lower()
+        part_desc = str(part_desc).lower()
+        
+        # Simple approach: look for part description words in corrective action
+        part_words = set(re.findall(r'\w+', part_desc))
+        corrective_words = re.findall(r'\w+', corrective_action)
+        
+        # Find sentences or phrases containing part-related words
+        relevant_sentences = []
+        for sentence in re.split(r'[.!?]', corrective_action):
+            if any(word in sentence for word in part_words):
+                relevant_sentences.append(sentence.strip())
+        
+        if relevant_sentences:
+            return ". ".join(relevant_sentences)
+        
+        # Fallback: return the full corrective action if no specific part mention found
+        return corrective_action
+
+    def get_embeddings_batch(self, texts: List[str], batch_size: int = 256) -> List[Optional[np.ndarray]]:
+        """Chunked batch retrieval (cache hits + batched API for misses)."""
+        out: List[Optional[np.ndarray]] = []
+        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding batches"):
+            batch = texts[i:i + batch_size]
+            out.extend(self.cache.get_batch_embeddings(batch, self.model))
+        return out
+
+    def _prep_embeddings(
+        self,
+        loss_df: pd.DataFrame,
+        parts_df: pd.DataFrame,
+        loss_id_col: str = "sloss_code_icomponent_id",
+        loss_text_col: str = "sdetail_desc_scomponent_desc",
+        part_id_col: str = "spart_no",
+        part_text_col: str = "spart_desc",
+    ):
+        """
+        Build L2-normalized embedding matrices (loss, part) aligned to the given DFs.
+        """
+        def _normalize(v: np.ndarray) -> np.ndarray:
+            v = np.asarray(v, dtype=np.float32)
+            n = np.linalg.norm(v)
+            return (v / n) if n > 0 else v
+
+        use_store = bool(self.embedding_store_path)
+        loss_store, part_store = None, None
+
+        if use_store:
+            # Try loading precomputed tables
+            loss_path = os.path.join(self.embedding_store_path, "loss_embeddings.parquet")
+            part_path = os.path.join(self.embedding_store_path, "part_embeddings.parquet")
+
+            if os.path.exists(loss_path):
+                loss_store = pd.read_parquet(loss_path)
+            if os.path.exists(part_path):
+                part_store = pd.read_parquet(part_path)
+
+        # --- Build LOSS side ---
+        loss_idx_keep, loss_vecs = [], []
+
+        if loss_store is not None and not loss_store.empty:
+            loss_map = dict(
+                zip(loss_store[loss_id_col].astype(str), loss_store["embedding"])
+            )
+            for i, rid in enumerate(loss_df[loss_id_col].astype(str).tolist()):
+                emb = loss_map.get(rid)
+                if emb is not None:
+                    loss_idx_keep.append(i)
+                    loss_vecs.append(_normalize(np.array(emb, dtype=np.float32)))
+
+        if not loss_vecs:
+            loss_texts = loss_df[loss_text_col].fillna("").astype(str).tolist()
+            loss_embs = self.get_embeddings_batch(loss_texts)
+            for i, e in enumerate(loss_embs):
+                if e is not None:
+                    loss_idx_keep.append(i)
+                    loss_vecs.append(_normalize(e))
+
+        if not loss_vecs:
+            raise ValueError("No valid loss embeddings found.")
+
+        loss_mat = np.stack(loss_vecs).astype(np.float32)
+
+        # --- Build PART side ---
+        part_idx_keep, part_vecs = [], []
+
+        if part_store is not None and not part_store.empty:
+            part_map = dict(
+                zip(part_store[part_id_col].astype(str), part_store["embedding"])
+            )
+            for i, pid in enumerate(parts_df[part_id_col].astype(str).tolist()):
+                emb = part_map.get(pid)
+                if emb is not None:
+                    part_idx_keep.append(i)
+                    part_vecs.append(_normalize(np.array(emb, dtype=np.float32)))
+
+        if len(part_idx_keep) < len(parts_df):
+            have = set(part_idx_keep)
+            missing_rows = [i for i in range(len(parts_df)) if i not in have]
+            if missing_rows:
+                miss_texts = parts_df.iloc[missing_rows][part_text_col].fillna("").astype(str).tolist()
+                miss_embs = self.get_embeddings_batch(miss_texts)
+                for idx_local, e in zip(missing_rows, miss_embs):
+                    if e is not None:
+                        part_idx_keep.append(idx_local)
+                        part_vecs.append(_normalize(e))
+
+        if not part_vecs:
+            raise ValueError("No valid part embeddings found.")
+
+        part_mat = np.stack(part_vecs).astype(np.float32)
+
+        return (loss_mat, loss_idx_keep), (part_mat, part_idx_keep)
+
+    def _prep_corrective_embeddings(
+        self,
+        parts_df: pd.DataFrame,
+        corrective_action_col: str = "corrective_action",
+        part_id_col: str = "spart_no",
+        part_text_col: str = "spart_desc",
+    ):
+        """
+        Prepare embeddings for corrective actions, extracting relevant parts for each component.
+        Ensure we only process parts that have valid corrective actions.
+        """
+        def _normalize(v: np.ndarray) -> np.ndarray:
+            v = np.asarray(v, dtype=np.float32)
+            n = np.linalg.norm(v)
+            return (v / n) if n > 0 else v
+
+        use_store = bool(self.embedding_store_path)
+        corrective_store = None
+        
+        if use_store:
+            corrective_path = os.path.join(self.embedding_store_path, "corrective_embeddings.parquet")
+            if os.path.exists(corrective_path):
+                corrective_store = pd.read_parquet(corrective_path)
+
+        # Build CORRECTIVE side - only for parts with valid corrective actions
+        corrective_idx_keep, corrective_vecs = [], []
+        corrective_texts = []
+
+        # First, identify which parts have valid corrective actions
+        valid_parts_mask = []
+        for i in range(len(parts_df)):
+            corrective_action = parts_df.iloc[i][corrective_action_col] if corrective_action_col in parts_df.columns else ""
+            if corrective_action and not pd.isna(corrective_action) and str(corrective_action).strip():
+                valid_parts_mask.append(True)
+            else:
+                valid_parts_mask.append(False)
+
+        if corrective_store is not None and not corrective_store.empty:
+            corrective_map = dict(
+                zip(corrective_store[part_id_col].astype(str), corrective_store["embedding"])
+            )
+            for i, pid in enumerate(parts_df[part_id_col].astype(str).tolist()):
+                # Only process if part has valid corrective action
+                if valid_parts_mask[i]:
+                    emb = corrective_map.get(pid)
+                    if emb is not None:
+                        corrective_idx_keep.append(i)
+                        corrective_vecs.append(_normalize(np.array(emb, dtype=np.float32)))
+                        corrective_texts.append(parts_df.iloc[i][corrective_action_col])
+
+        # Compute missing corrective action embeddings only for valid parts
+        have = set(corrective_idx_keep)
+        missing_rows = [i for i in range(len(parts_df)) if valid_parts_mask[i] and i not in have]
+        
+        if missing_rows:
+            relevant_actions = []
+            for idx in missing_rows:
+                part_desc = parts_df.iloc[idx][part_text_col]
+                full_action = parts_df.iloc[idx][corrective_action_col]
+                relevant_action = self._extract_relevant_corrective_action(full_action, part_desc)
+                relevant_actions.append(relevant_action)
+                corrective_texts.append(full_action)
+
+            miss_embs = self.corrective_cache.get_batch_embeddings(relevant_actions, self.model)
+            
+            for idx_local, e in zip(missing_rows, miss_embs):
+                if e is not None:
+                    corrective_idx_keep.append(idx_local)
+                    corrective_vecs.append(_normalize(e))
+
+        if not corrective_vecs:
+            return None, None, None
+
+        corrective_mat = np.stack(corrective_vecs).astype(np.float32)
+        return corrective_mat, corrective_idx_keep, corrective_texts
+
+    def get_top_n_matches_efficient(self, loss_df: pd.DataFrame, parts_df: pd.DataFrame, n: int = 5, block: int = 4096) -> pd.DataFrame:
+        """Top-N per part using vectorized blocks (fast, memory friendly)."""
+        print("Preparing embeddings for efficient top-N...")
+        (loss_mat, loss_idx), (part_mat, part_idx) = self._prep_embeddings(loss_df, parts_df)
+        Lp, D = loss_mat.shape
+        Pp, _ = part_mat.shape
+        results = []
+
+        for start in tqdm(range(0, Pp, block), desc="Top-N blocks"):
+            stop = min(start + block, Pp)
+            sims = loss_mat @ part_mat[start:stop].T
+            k = min(n, Lp)
+            top_rows = np.argpartition(-sims, kth=k-1, axis=0)[:k, :]
+            for j in range(sims.shape[1]):
+                rows = top_rows[:, j]
+                order = np.argsort(-sims[rows, j])
+                rows = rows[order]
+                p_i = part_idx[start + j]
+                p_no = parts_df.iloc[p_i]["spart_no"]
+                p_desc = parts_df.iloc[p_i]["spart_desc"]
+                for r in rows:
+                    l_i = loss_idx[r]
+                    results.append({
+                        "spart_no": p_no,
+                        "spart_desc": p_desc,
+                        "sloss_code_icomponent_id": loss_df.iloc[l_i]["sloss_code_icomponent_id"],
+                        "loss_description": loss_df.iloc[l_i]["sdetail_desc_scomponent_desc"],
+                        "similarity_score": float(sims[r, j]),
+                        "corrective_action_text": "",
+                        "embedding_source": "part_description",
+                    })
+        return pd.DataFrame(results)
+
+    def get_top_n_matches_both_sources(
+        self, 
+        loss_df: pd.DataFrame, 
+        parts_df: pd.DataFrame, 
+        n: int = 5, 
+        block: int = 4096,
+        corrective_action_col: str = "corrective_action"
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        """
+        Generate top-N matches from both part descriptions and corrective actions.
+        Returns: (top_matches_part, top_matches_corrective)
+        """
+        print("Preparing embeddings for top-N from both sources...")
+        
+        # Get regular part embeddings (always available)
+        (loss_mat, loss_idx), (part_mat, part_idx) = self._prep_embeddings(loss_df, parts_df)
+        
+        # Get top matches based on part descriptions
+        top_matches_part = self._get_top_n_from_embeddings(
+            loss_mat, loss_idx, part_mat, part_idx, loss_df, parts_df, n, block, "part_description"
+        )
+        
+        # Get corrective action embeddings if available
+        top_matches_corrective = None
+        if corrective_action_col in parts_df.columns:
+            corrective_mat, corrective_idx, corrective_texts = self._prep_corrective_embeddings(
+                parts_df, corrective_action_col
+            )
+            
+            # FIX: Changed condition to be more lenient - only require that we have some corrective embeddings
+            if corrective_mat is not None and len(corrective_idx) > 0:
+                print(f"Generating top matches from corrective actions... (found {len(corrective_idx)} corrective embeddings)")
+                print(f"Part embeddings: {len(part_idx)}, Corrective embeddings: {len(corrective_idx)}")
+                
+                # Use the original method but only for parts that have corrective embeddings
+                top_matches_corrective = self._get_top_n_from_embeddings(
+                    loss_mat, loss_idx, corrective_mat, corrective_idx, loss_df, parts_df, n, block, "corrective_action", corrective_texts
+                )
+            else:
+                print("Warning: No valid corrective embeddings found")
+        
+        return top_matches_part, top_matches_corrective
+
+    def _get_top_n_from_embeddings(
+        self, 
+        loss_mat: np.ndarray, 
+        loss_idx: List[int], 
+        target_mat: np.ndarray, 
+        target_idx: List[int], 
+        loss_df: pd.DataFrame, 
+        parts_df: pd.DataFrame, 
+        n: int, 
+        block: int,
+        source_type: str,
+        corrective_texts: Optional[List[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Helper method to generate top-N matches from given embeddings.
+        """
+        Lp, D = loss_mat.shape
+        Pp, _ = target_mat.shape
+        results = []
+
+        for start in tqdm(range(0, Pp, block), desc=f"Top-N blocks ({source_type})"):
+            stop = min(start + block, Pp)
+            sims = loss_mat @ target_mat[start:stop].T
+            k = min(n, Lp)
+            top_rows = np.argpartition(-sims, kth=k-1, axis=0)[:k, :]
+            
+            for j in range(sims.shape[1]):
+                rows = top_rows[:, j]
+                order = np.argsort(-sims[rows, j])
+                rows = rows[order]
+                p_i = target_idx[start + j]
+                p_no = parts_df.iloc[p_i]["spart_no"]
+                p_desc = parts_df.iloc[p_i]["spart_desc"]
+                
+                corrective_text = ""
+                if source_type == "corrective_action" and corrective_texts:
+                    corrective_text = corrective_texts[start + j]
+                
+                for r in rows:
+                    l_i = loss_idx[r]
+                    results.append({
+                        "spart_no": p_no,
+                        "spart_desc": p_desc,
+                        "sloss_code_icomponent_id": loss_df.iloc[l_i]["sloss_code_icomponent_id"],
+                        "loss_description": loss_df.iloc[l_i]["sdetail_desc_scomponent_desc"],
+                        "similarity_score": float(sims[r, j]),
+                        "corrective_action_text": corrective_text,
+                        "embedding_source": source_type
+                    })
+        
+        return pd.DataFrame(results)
+
+    def calculate_similarity_matrix(self, loss_df: pd.DataFrame, parts_df: pd.DataFrame) -> pd.DataFrame:
+        """Build full cosine similarity matrix (normalized embeddings -> dot product)."""
+        print("Preparing embeddings for full similarity matrix...")
+        (loss_mat, loss_idx), (part_mat, part_idx) = self._prep_embeddings(loss_df, parts_df)
+        print("Calculating cosine similarity (matrix multiply)...")
+        sim = loss_mat @ part_mat.T
+        loss_codes = loss_df.iloc[loss_idx]["sloss_code_icomponent_id"].values
+        loss_descs = loss_df.iloc[loss_idx]["sdetail_desc_scomponent_desc"].values
+        part_nos = parts_df.iloc[part_idx]["spart_no"].values
+        part_descs = parts_df.iloc[part_idx]["spart_desc"].values
+        similarity_df = pd.DataFrame(
+            sim,
+            index=pd.MultiIndex.from_arrays([loss_codes, loss_descs], names=["sloss_code_icomponent_id", "loss_description"]),
+            columns=pd.MultiIndex.from_arrays([part_nos, part_descs], names=["spart_no", "part_description"]),
+        )
+        return similarity_df
+
+    def create_similarity_matrix_flat(self, similarity_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Flatten a MultiIndex similarity matrix into a tidy DataFrame.
+        """
+        flat = (
+            similarity_df
+            .stack(level=list(range(similarity_df.columns.nlevels)))
+            .rename("similarity_score")
+            .reset_index()
+        )
+
+        row_levels = [
+            (n if n is not None else f"row_level_{i}")
+            for i, n in enumerate(similarity_df.index.names)
+        ]
+        col_levels = [
+            (n if n is not None else f"col_level_{i}")
+            for i, n in enumerate(similarity_df.columns.names)
+        ]
+
+        flat.columns = row_levels + col_levels + ["similarity_score"]
+
+        if len(row_levels) == 2 and len(col_levels) == 2:
+            flat = flat.rename(
+                columns={
+                    row_levels[0]: "sloss_code_icomponent_id",
+                    row_levels[1]: "loss_description",
+                    col_levels[0]: "spart_no",
+                    col_levels[1]: "part_description",
+                }
+            )
+
+        return flat
+
+def build_loss_embeddings_df(
+    loss_df: pd.DataFrame,
+    calculator: "SimilarityCalculator",
+    id_col: str = "sloss_code_icomponent_id",
+    text_col: str = "sdetail_desc_scomponent_desc",
+    batch_size: int = 256,
+) -> pd.DataFrame:
+    """
+    Build a DataFrame of loss-code embeddings.
+    """
+    if id_col not in loss_df.columns or text_col not in loss_df.columns:
+        raise ValueError(f"loss_df must contain columns: {id_col}, {text_col}")
+
+    texts = loss_df[text_col].fillna("").astype(str).tolist()
+    embs = calculator.get_embeddings_batch(texts, batch_size=batch_size)
+
+    out = []
+    ts = datetime.utcnow().isoformat()
+    for i, e in enumerate(embs):
+        if e is not None:
+            out.append({
+                id_col: loss_df.iloc[i][id_col],
+                text_col: loss_df.iloc[i][text_col],
+                "embedding": e.tolist(),
+                "model": calculator.model,
+                "updated_at": ts,
+            })
+    return pd.DataFrame(out)
+
+def upsert_part_embeddings(
+    parts_df: pd.DataFrame,
+    calculator: "SimilarityCalculator",
+    existing_parts_emb_df: Optional[pd.DataFrame] = None,
+    id_col: str = "spart_no",
+    text_col: str = "spart_desc",
+    batch_size: int = 256,
+) -> pd.DataFrame:
+    """
+    Incrementally upsert embeddings by spart_no.
+    """
+    if id_col not in parts_df.columns or text_col not in parts_df.columns:
+        raise ValueError(f"parts_df must contain columns: {id_col}, {text_col}")
+
+    if existing_parts_emb_df is not None and not existing_parts_emb_df.empty:
+        keep_cols = {id_col, text_col, "embedding", "model", "updated_at"}
+        missing = keep_cols - set(existing_parts_emb_df.columns)
+        if missing:
+            raise ValueError(f"existing_parts_emb_df missing columns: {sorted(missing)}")
+        existing = existing_parts_emb_df.copy()
+    else:
+        existing = pd.DataFrame(columns=[id_col, text_col, "embedding", "model", "updated_at"])
+
+    seen_ids = set(existing[id_col].astype(str)) if not existing.empty else set()
+    parts_df[id_col] = parts_df[id_col].astype(str)
+    new_rows = parts_df[~parts_df[id_col].isin(seen_ids)].reset_index(drop=True)
+
+    if new_rows.empty:
+        return existing.reset_index(drop=True)
+
+    # FIXED: Changed .ast(str) to .astype(str)
+    texts = new_rows[text_col].fillna("").astype(str).tolist()
+    embs = calculator.get_embeddings_batch(texts, batch_size=batch_size)
+
+    ts = datetime.utcnow().isoformat()
+    to_add = []
+    for i, e in enumerate(embs):
+        if e is not None:
+            to_add.append({
+                id_col: new_rows.iloc[i][id_col],
+                text_col: new_rows.iloc[i][text_col],
+                "embedding": e.tolist(),
+                "model": calculator.model,
+                "updated_at": ts,
+            })
+    
+    add_df = pd.DataFrame(to_add)
+    updated = pd.concat([existing, add_df], ignore_index=True)
+    updated = (
+        updated
+        .sort_values(["updated_at"])
+        .drop_duplicates(subset=[id_col], keep="last")
+        .reset_index(drop=True)
+    )
+    return updated
+
+def build_corrective_embeddings_df(
+    parts_df: pd.DataFrame,
+    calculator: "SimilarityCalculator",
+    id_col: str = "spart_no",
+    text_col: str = "spart_desc",
+    corrective_action_col: str = "corrective_action",
+    batch_size: int = 256,
+) -> pd.DataFrame:
+    """
+    Build a DataFrame of corrective action embeddings.
+    """
+    if id_col not in parts_df.columns or corrective_action_col not in parts_df.columns:
+        raise ValueError(f"parts_df must contain columns: {id_col}, {corrective_action_col}")
+
+    relevant_actions = []
+    for _, row in parts_df.iterrows():
+        relevant_action = calculator._extract_relevant_corrective_action(
+            row[corrective_action_col], row[text_col]
+        )
+        relevant_actions.append(relevant_action)
+
+    embs = calculator.corrective_cache.get_batch_embeddings(relevant_actions, calculator.model)
+
+    out = []
+    ts = datetime.utcnow().isoformat()
+    for i, e in enumerate(embs):
+        if e is not None:
+            out.append({
+                id_col: parts_df.iloc[i][id_col],
+                text_col: parts_df.iloc[i][text_col],
+                "corrective_action": parts_df.iloc[i][corrective_action_col],
+                "relevant_corrective_action": relevant_actions[i],
+                "embedding": e.tolist(),
+                "model": calculator.model,
+                "updated_at": ts,
+            })
+    return pd.DataFrame(out)
+
+def upsert_corrective_embeddings(
+    parts_df: pd.DataFrame,
+    calculator: "SimilarityCalculator",
+    existing_corrective_emb_df: Optional[pd.DataFrame] = None,
+    id_col: str = "spart_no",
+    text_col: str = "spart_desc",
+    corrective_action_col: str = "corrective_action",
+    batch_size: int = 256,
+) -> pd.DataFrame:
+    """
+    Incrementally upsert corrective action embeddings.
+    """
+    if id_col not in parts_df.columns or corrective_action_col not in parts_df.columns:
+        raise ValueError(f"parts_df must contain columns: {id_col}, {corrective_action_col}")
+
+    if existing_corrective_emb_df is not None and not existing_corrective_emb_df.empty:
+        keep_cols = {id_col, text_col, "corrective_action", "relevant_corrective_action", "embedding", "model", "updated_at"}
+        missing = keep_cols - set(existing_corrective_emb_df.columns)
+        if missing:
+            raise ValueError(f"existing_corrective_emb_df missing columns: {sorted(missing)}")
+        existing = existing_corrective_emb_df.copy()
+    else:
+        existing = pd.DataFrame(columns=[id_col, text_col, "corrective_action", "relevant_corrective_action", "embedding", "model", "updated_at"])
+
+    seen_ids = set(existing[id_col].astype(str)) if not existing.empty else set()
+    parts_df[id_col] = parts_df[id_col].astype(str)
+    new_rows = parts_df[~parts_df[id_col].isin(seen_ids)].reset_index(drop=True)
+
+    if new_rows.empty:
+        return existing.reset_index(drop=True)
+
+    relevant_actions = []
+    for _, row in new_rows.iterrows():
+        relevant_action = calculator._extract_relevant_corrective_action(
+            row[corrective_action_col], row[text_col]
+        )
+        relevant_actions.append(relevant_action)
+
+    embs = calculator.corrective_cache.get_batch_embeddings(relevant_actions, calculator.model)
+
+    ts = datetime.utcnow().isoformat()
+    to_add = []
+    for i, e in enumerate(embs):
+        if e is not None:
+            to_add.append({
+                id_col: new_rows.iloc[i][id_col],
+                text_col: new_rows.iloc[i][text_col],
+                "corrective_action": new_rows.iloc[i][corrective_action_col],
+                "relevant_corrective_action": relevant_actions[i],
+                "embedding": e.tolist(),
+                "model": calculator.model,
+                "updated_at": ts,
+            })
+    
+    add_df = pd.DataFrame(to_add)
+    updated = pd.concat([existing, add_df], ignore_index=True)
+    updated = (
+        updated
+        .sort_values(["updated_at"])
+        .drop_duplicates(subset=[id_col], keep="last")
+        .reset_index(drop=True)
+    )
+    return updated
+
+def save_created_embeddings(
+    loss_code_df,
+    part_only_his_fin_df,
+    calculator,
+    loss=False,
+    upsert_part=True,
+    upsert_corrective=True,
+    embedding_path="/Volumes/cat_gsfsind_acr_dev/base/ingest/Workings/akoppu/similarity_results",
+):
+    if loss:
+        loss_emb_df = build_loss_embeddings_df(loss_code_df, calculator)
+        loss_path = f"{embedding_path}/loss_embeddings.parquet"
+        print(f"Saving loss embeddings to {loss_path}")
+        loss_emb_df.to_parquet(loss_path, index=False)
+
+    # Part embeddings
+    if upsert_part:
+        part_emb_store = f"{embedding_path}/part_embeddings.parquet"
+        if os.path.exists(part_emb_store):
+            existing_parts_emb_df = pd.read_parquet(part_emb_store)
+        else:
+            existing_parts_emb_df = None
+
+        updated_parts_emb_df = upsert_part_embeddings(
+            parts_df=part_only_his_fin_df,
+            calculator=calculator,
+            existing_parts_emb_df=existing_parts_emb_df,
+            id_col="spart_no",
+            text_col="spart_desc",
+            batch_size=512
+        )
+        print(f"Saving part embeddings to {part_emb_store}")
+        updated_parts_emb_df.to_parquet(part_emb_store, index=False)
+
+    # Corrective action embeddings
+    if upsert_corrective and "corrective_action" in part_only_his_fin_df.columns:
+        corrective_emb_store = f"{embedding_path}/corrective_embeddings.parquet"
+        if os.path.exists(corrective_emb_store):
+            existing_corrective_emb_df = pd.read_parquet(corrective_emb_store)
+        else:
+            existing_corrective_emb_df = None
+
+        updated_corrective_emb_df = upsert_corrective_embeddings(
+            parts_df=part_only_his_fin_df,
+            calculator=calculator,
+            existing_corrective_emb_df=existing_corrective_emb_df,
+            id_col="spart_no",
+            text_col="spart_desc",
+            corrective_action_col="corrective_action",
+            batch_size=512
+        )
+        print(f"Saving corrective action embeddings to {corrective_emb_store}")
+        updated_corrective_emb_df.to_parquet(corrective_emb_store, index=False)
+
+def calculate_similarity_for_databricks(
+    loss_df: pd.DataFrame,
+    parts_df: pd.DataFrame,
+    openai_api_key: str,
+    top_n: int = 5,
+    efficient: bool = True,
+    use_both_sources: bool = False,
+    OUTPUT_DIR: str = OUTPUT_DIR,
+    BASE_DIR: str = BASE_DIR,
+    embedding_path: str = embedding_path,
+    save_loss_embedding: bool = False,
+    upsert_part_save: bool = True,
+    upsert_corrective_save: bool = True,
+):
+    """Main callable for Databricks notebooks."""
+
+    calculator = SimilarityCalculator(
+        openai_api_key=openai_api_key,
+        model="text-embedding-3-small",
+        cache_path=f"{BASE_DIR}/similarity_cache",
+        embedding_store_path=embedding_path
+    )
+
+    save_created_embeddings(
+        loss_code_df=loss_df,
+        part_only_his_fin_df=parts_df,
+        calculator=calculator,
+        loss=save_loss_embedding,
+        upsert_part=upsert_part_save,
+        upsert_corrective=upsert_corrective_save,
+        embedding_path=embedding_path
+    )
+
+    if efficient:
+        print("Using efficient top-N...")
+        if use_both_sources and "corrective_action" in parts_df.columns:
+            print("Generating top matches from both part descriptions and corrective actions...")
+            top_matches_part, top_matches_corrective = calculator.get_top_n_matches_both_sources(
+                loss_df, parts_df, n=top_n, corrective_action_col="corrective_action"
+            )
+        else:
+            print("Generating top matches from part descriptions only...")
+            top_matches_part = calculator.get_top_n_matches_efficient(loss_df, parts_df, n=top_n)
+            top_matches_corrective = None
+
+        if len(loss_df) * len(parts_df) < 30000:
+            similarity_matrix = calculator.calculate_similarity_matrix(loss_df, parts_df)
+            flat_matrix = calculator.create_similarity_matrix_flat(similarity_matrix)
+        else:
+            print("Skipping full matrix computation... size > 30000 ")
+            similarity_matrix = None
+            flat_matrix = None
+    else:
+        print("Using full similarity matrix approach...")
+        similarity_matrix = calculator.calculate_similarity_matrix(loss_df, parts_df)
+        flat = calculator.create_similarity_matrix_flat(similarity_matrix)
+        top_matches_part = (
+            flat.sort_values(["spart_no", "similarity_score"], ascending=[True, False])
+            .groupby("spart_no")
+            .head(top_n)
+            .reset_index(drop=True)
+        )
+        top_matches_part["embedding_source"] = "part_description"
+        top_matches_part["corrective_action_text"] = ""
+        
+        top_matches_corrective = None
+        if use_both_sources and "corrective_action" in parts_df.columns:
+            print("Warning: Corrective action matching not implemented for full matrix approach")
+        
+        flat_matrix = flat
+
+    # Save outputs
+    output_path = OUTPUT_DIR
+    os.makedirs(output_path, exist_ok=True)
+
+    if similarity_matrix is not None:
+        print(f"Saving similarity matrix... {output_path}/similarity_matrix.csv")
+        similarity_matrix.to_csv(f"{output_path}/similarity_matrix.csv")
+
+    print(f"Saving part-based top matches... {output_path}/top_matches_part.csv")
+    top_matches_part.to_csv(f"{output_path}/top_matches_part.csv", index=False)
+
+    if top_matches_corrective is not None:
+        print(f"Saving corrective-action-based top matches... {output_path}/top_matches_corrective.csv")
+        top_matches_corrective.to_csv(f"{output_path}/top_matches_corrective.csv", index=False)
+
+    if flat_matrix is not None:
+        print(f"Saving flat similarity matrix... {output_path}/flat_similarity_matrix.csv")
+        flat_matrix.to_csv(f"{output_path}/flat_similarity_matrix.csv", index=False)
+
+    print(f"Results saved to {output_path}")
+    return similarity_matrix, top_matches_part, top_matches_corrective, flat_matrix
+
+def filter_top_n_by_part(flat_matrix: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    return (
+        flat_matrix.sort_values(["spart_no", "similarity_score"], ascending=[True, False])
+        .groupby("spart_no")
+        .head(n)
+        .reset_index(drop=True)
+    )
+
+def filter_top_n_by_loss_code(flat_matrix: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    return (
+        flat_matrix.sort_values(["sloss_code_icomponent_id", "similarity_score"], ascending=[True, False])
+        .groupby("sloss_code_icomponent_id")
+        .head(n)
+        .reset_index(drop=True)
+    )
+
+def find_similar_above_threshold(flat_matrix: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+    return flat_matrix[flat_matrix["similarity_score"] >= threshold].sort_values("similarity_score", ascending=False)
+
+def compare_similarity_results(
+    top_matches_part: pd.DataFrame,
+    top_matches_corrective: pd.DataFrame,
+    parts_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Compare similarity results from part descriptions vs corrective actions.
+    """
+    if top_matches_corrective is None:
+        return pd.DataFrame({"message": ["No corrective action results available"]})
+    
+    comparison_data = []
+    
+    for part_no in parts_df["spart_no"].unique():
+        part_matches = top_matches_part[top_matches_part["spart_no"] == part_no]
+        corrective_matches = top_matches_corrective[top_matches_corrective["spart_no"] == part_no]
+        
+        top_part = part_matches.head(1)
+        top_corrective = corrective_matches.head(1)
+        
+        if not top_part.empty and not top_corrective.empty:
+            comparison_data.append({
+                "spart_no": part_no,
+                "spart_desc": parts_df[parts_df["spart_no"] == part_no]["spart_desc"].iloc[0],
+                "top_part_loss_id": top_part["sloss_code_icomponent_id"].iloc[0],
+                "top_part_score": top_part["similarity_score"].iloc[0],
+                "top_corrective_loss_id": top_corrective["sloss_code_icomponent_id"].iloc[0],
+                "top_corrective_score": top_corrective["similarity_score"].iloc[0],
+                "score_difference": abs(top_part["similarity_score"].iloc[0] - top_corrective["similarity_score"].iloc[0]),
+                "same_top_match": top_part["sloss_code_icomponent_id"].iloc[0] == top_corrective["sloss_code_icomponent_id"].iloc[0]
+            })
+    
+    return pd.DataFrame(comparison_data)
+
+def main_embedding_ranking(
+    loss_codes_df,
+    parts_only_his_fin_df,
+    api_key=open_api_key,
+    top_n=15,
+    efficient=True,
+    use_both_sources=False,
+    save_loss_embedding=False,
+    upsert_part_save=True,
+    upsert_corrective_save=True,
+    OUTPUT_DIR=OUTPUT_DIR,
+    BASE_DIR=BASE_DIR,
+    embedding_path=embedding_path,
+):
+    loss_code_df_pd = loss_codes_df.toPandas()
+    part_only_his_fin_df_pd = parts_only_his_fin_df.toPandas()
+
+    print(f"Loss code df ... {loss_code_df_pd.shape}")
+    print(f"Parts df ... {part_only_his_fin_df_pd.shape}")
+
+    if use_both_sources and "corrective_action" not in part_only_his_fin_df_pd.columns:
+        print("Warning: corrective_action column not found in parts dataframe. Using part descriptions only.")
+        use_both_sources = False
+
+    similarity_matrix, top_matches_part, top_matches_corrective, flat_matrix = calculate_similarity_for_databricks(
+        loss_df=loss_code_df_pd,
+        parts_df=part_only_his_fin_df_pd,
+        openai_api_key=api_key,
+        top_n=top_n,
+        efficient=efficient,
+        use_both_sources=use_both_sources,
+        OUTPUT_DIR=OUTPUT_DIR,
+        BASE_DIR=BASE_DIR,
+        embedding_path=embedding_path,
+        save_loss_embedding=save_loss_embedding,
+        upsert_part_save=upsert_part_save,
+        upsert_corrective_save=upsert_corrective_save
+    )
+
+    print("\n=== Job Completed ===")
+    if similarity_matrix is not None:
+        print(f"Similarity matrix saved: {OUTPUT_DIR}/similarity_matrix.csv")
+    print(f"Part-based top matches saved: {OUTPUT_DIR}/top_matches_part.csv")
+    if top_matches_corrective is not None:
+        print(f"Corrective-action-based top matches saved: {OUTPUT_DIR}/top_matches_corrective.csv")
+    if flat_matrix is not None:
+        print(f"Flat similarity matrix saved: {OUTPUT_DIR}/flat_similarity_matrix.csv")
+
+    return similarity_matrix, top_matches_part, top_matches_corrective, flat_matrix
+
+
+
+def get_updated_rank_df_with_missing(
+    rank_df: DataFrame,                      # (unused in original; kept for signature compatibility)
+    top_matches: Sequence[Mapping],          # list[dict]-like rows for primary matches
+    no_rank_df: DataFrame,                   # used to bring in snapshot_date by spart_no
+    top_matches_corrective: DataFrame = None,  # optional second set
+) -> DataFrame:
+    """
+    Normalize top-match inputs, compute per-part rankings by similarity_score,
+    (optionally) union corrective matches, and attach snapshot_date from no_rank_df.
+
+    Returns a DataFrame with:
+      - original match columns (renamed/parsed)
+      - rank_in_part (dense rank per spart_no by similarity_score desc)
+      - snapshot_date (joined from no_rank_df on spart_no)
+      - cum_occurrences (NULL int placeholder)
+    """
+
+    # -- Helper to normalize a top_matches-like list into a Spark DataFrame --
+    def _normalize_top_matches(rows: Sequence[Mapping]) -> DataFrame:
+        # Convert to Spark DF
+        df = spark.createDataFrame(rows)
+
+        # 1) Rename to align with downstream joins/semantics
+        df = df.withColumnRenamed("loss_description", "sdetail_desc")
+
+        # 2) Split "sloss_code_icomponent_id" into two columns.
+        #    Keep sloss_code as string (to preserve leading zeros), cast component id to int.
+        #    Use regexp_extract for robustness, even if more underscores appear elsewhere.
+        df = (
+            df.withColumn(
+                "sloss_code",
+                F.regexp_extract(F.col("sloss_code_icomponent_id"), r'^([^_]+)', 1)
+            )
+            .withColumn(
+                "icomponent_id",
+                F.regexp_extract(F.col("sloss_code_icomponent_id"), r'^[^_]+_(\d+)', 1).cast("int")
+            )
+            .drop("sloss_code_icomponent_id")
+        )
+
+        # 3) Rank within each spart_no by similarity_score (higher = better)
+        w = Window.partitionBy("spart_no").orderBy(F.col("similarity_score").desc())
+        df = df.withColumn("rank_in_part", F.dense_rank().over(w))
+
+        # Optional: stable presentation order if you .show()
+        df = df.orderBy("spart_no", "rank_in_part", F.col("similarity_score").desc())
+
+        return df
+
+    # --- Build primary ranked set ---
+    df_ranked = _normalize_top_matches(top_matches)
+
+    # --- Optional corrective set; union by name to avoid column-order mismatches ---
+    if top_matches_corrective is not None:
+        df_ranked_corr = _normalize_top_matches(top_matches_corrective)
+        # unionByName handles column order; allowMissingColumns=True in case inputs differ
+        df_ranked = df_ranked.unionByName(df_ranked_corr, allowMissingColumns=True)
+
+    # --- Attach snapshot_date from no_rank_df (distinct by spart_no, snapshot_date) ---
+    snapshot_right = no_rank_df.select("spart_no", "snapshot_date").distinct()
+    updated_rank_df = (
+        df_ranked
+        .join(snapshot_right, on="spart_no", how="left")
+        .withColumn("cum_occurrences", F.lit(None).cast("int"))  # placeholder as in original
+    )
+
+    return updated_rank_df
+
+
+
+
+
+# USAGE-----------------------------------------------------------------------------------------------------------
+sample_rows = (
+    freq_affected_older
+    .orderBy(F.rand())   # or orderBy("snapshot_date").desc() for latest 20
+    # .limit(100)
+    .collect()
+)
+
+sample_keys_sdf = spark.createDataFrame(sample_rows, schema=freq_affected_older.schema) \
+    .select("spart_no", "snapshot_date", "initial_loss_code", "initial_part_desc", "CORRECTION") \
+    .dropDuplicates()
+
+# All pairs we need to cover
+pairs_sdf = sample_keys_sdf.select("spart_no", "snapshot_date").distinct()
+
+# Assy --> Assembly , INSTRUM --> Instrument
+no_rank_df = sample_keys_sdf.withColumnRenamed("initial_loss_code", "sloss_code").join(rank_with_loss_des, on =['spart_no', 'snapshot_date', 'sloss_code'], how='leftanti')
+
+print(no_rank_df.select("spart_no").distinct().count())
+print(sample_keys_sdf.select("spart_no").distinct().count())
+
+
+
+if no_rank_df.count() > 0:
+    all_loss_codes_df = get_loss_df_for_embeddings(scs_loss_codes, scs_components)
+
+    parts_only_his_fin_df = (no_rank_df
+                             .select('spart_no', F.col('initial_part_desc').alias('spart_desc'), F.trim(F.col("CORRECTION")).alias("corrective_action"))
+                             .withColumn("spart_desc", F.lower(F.trim(F.col('spart_desc'))))
+                             .withColumn( "spart_desc",
+                                F.trim(
+                                    F.regexp_replace( F.regexp_replace(F.col("spart_desc"), r"[%=\+$]", " "),  # replace these with space
+                                        r"\s+", " "                                              # normalize spaces
+                                    )))
+                             
+    )
+
+    similarity_matrix, top_matches_part, top_matches_corrective, flat_matrix =  main_embedding_ranking(
+                                                                            loss_codes_df = all_loss_codes_df, 
+                                                                            parts_only_his_fin_df=parts_only_his_fin_df,
+                                                                            top_n=10,
+                                                                            use_both_sources=True 
+                                                                            )
+    updated_rank_df = get_updated_rank_df_with_missing(rank_df, top_matches_part, no_rank_df ,top_matches_corrective)
+
+
+
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+
+def get_top_candidates(
+    rank_like_df,          # rank_df OR updated_rank_df
+    pairs_sdf,             # keys to restrict (spart_no, snapshot_date)
+    sample_keys_sdf,       # must have initial_loss_code
+    top_n: int = 5
+):
+    """
+    Select top candidates per (spart_no, snapshot_date) with two modes:
+    - Embedding mode (if 'similarity_score' and 'embedding_source' present):
+        Top-N per (spart_no, snapshot_date, embedding_source) by similarity_score desc.
+    - Frequency mode (else):
+        Top-N per (spart_no, snapshot_date) by rank_in_part desc.
+
+    Force-include each pair's initial_loss_code if it exists in the input for that pair.
+    Returns a pandas.DataFrame with normalized snapshot_date.
+    """
+    # Restrict to target (spart_no, snapshot_date) pairs
+    base = (
+        rank_like_df
+        .join(pairs_sdf, on=["spart_no", "snapshot_date"], how="inner")
+        .dropna(subset=["sloss_code"])
+    )
+
+    has_embed = all(c in base.columns for c in ["similarity_score", "embedding_source"])
+
+    if has_embed:
+        # -------- Embedding mode: Top-N per (spart_no, snapshot_date, embedding_source) --------
+        w = Window.partitionBy("spart_no", "snapshot_date", "embedding_source") \
+                  .orderBy(F.col("similarity_score").desc())
+
+        top_df = (
+            base
+            .select(
+                "spart_no", "snapshot_date", "sloss_code", "sdetail_desc",
+                "rank_in_part", "cum_occurrences", "similarity_score", "embedding_source"
+            )
+            .dropDuplicates(["spart_no", "snapshot_date", "sloss_code", "embedding_source"])
+            .withColumn("rn", F.row_number().over(w))
+            .filter(F.col("rn") <= top_n)
+            .drop("rn")
+        )
+
+        # Force-include initial_loss_code (if present in this input for that pair)
+        extras_df = (
+            sample_keys_sdf
+            .filter(F.col("initial_loss_code").isNotNull() & (F.trim(F.col("initial_loss_code")) != ""))
+            .join(
+                base.select(
+                    "spart_no","snapshot_date","sloss_code","sdetail_desc",
+                    "rank_in_part","cum_occurrences","similarity_score","embedding_source"
+                ).dropDuplicates(["spart_no","snapshot_date","sloss_code","embedding_source"]).alias("m"),
+                on=["spart_no","snapshot_date"],
+                how="left"
+            )
+            .filter(F.col("m.sloss_code") == F.col("initial_loss_code"))
+            .select(
+                F.col("spart_no"),
+                F.col("snapshot_date"),
+                F.col("m.sloss_code").alias("sloss_code"),
+                F.col("m.sdetail_desc").alias("sdetail_desc"),
+                F.col("m.rank_in_part").alias("rank_in_part"),
+                F.col("m.cum_occurrences").alias("cum_occurrences"),
+                F.col("m.similarity_score").alias("similarity_score"),
+                F.col("m.embedding_source").alias("embedding_source"),
+            )
+        )
+
+        cands_all_pairs_spark = (
+            top_df
+            .unionByName(extras_df)
+            .dropna(subset=["sloss_code"])
+            .dropDuplicates(["spart_no", "snapshot_date", "sloss_code"])  # dedupe across sources
+            .select(
+                "spart_no", "snapshot_date", "sloss_code", "sdetail_desc",
+                "rank_in_part", "cum_occurrences", "similarity_score", "embedding_source"
+            )
+        )
+
+    else:
+        # -------- Frequency mode: Top-N per (spart_no, snapshot_date) by rank_in_part --------
+        w = Window.partitionBy("spart_no", "snapshot_date").orderBy(F.col("rank_in_part").desc())
+
+        top_df = (
+            base
+            .select("spart_no", "snapshot_date", "sloss_code", "sdetail_desc",
+                    "cum_occurrences", "rank_in_part")
+            .dropDuplicates(["spart_no", "snapshot_date", "sloss_code"])
+            .withColumn("rn", F.row_number().over(w))
+            .filter(F.col("rn") <= top_n)
+            .drop("rn")
+        )
+
+        extras_df = (
+            sample_keys_sdf
+            .filter(F.col("initial_loss_code").isNotNull() & (F.trim(F.col("initial_loss_code")) != ""))
+            .join(
+                base.select(
+                    "spart_no","snapshot_date","sloss_code","sdetail_desc",
+                    "cum_occurrences","rank_in_part"
+                ).dropDuplicates(["spart_no","snapshot_date","sloss_code"]).alias("m"),
+                on=["spart_no","snapshot_date"],
+                how="left"
+            )
+            .filter(F.col("m.sloss_code") == F.col("initial_loss_code"))
+            .select(
+                F.col("spart_no"),
+                F.col("snapshot_date"),
+                F.col("m.sloss_code").alias("sloss_code"),
+                F.col("m.sdetail_desc").alias("sdetail_desc"),
+                F.col("m.cum_occurrences").alias("cum_occurrences"),
+                F.col("m.rank_in_part").alias("rank_in_part"),
+            )
+        )
+
+        cands_all_pairs_spark = (
+            top_df
+            .unionByName(extras_df)
+            .dropna(subset=["sloss_code"])
+            .dropDuplicates(["spart_no", "snapshot_date", "sloss_code"])
+            .select(
+                "spart_no", "snapshot_date", "sloss_code", "sdetail_desc",
+                "rank_in_part", "cum_occurrences",
+                
+            )
+            # .withColumn("similarity_score", F.lit(None).cast("double"))
+            # .withColumn("embedding_source", F.lit(None).cast("string"))
+        )
+
+    # Convert to Pandas and normalize date string for easy downstream filtering
+    cands_pd_all = (
+        cands_all_pairs_spark
+        .withColumn("snapshot_date_str", F.date_format("snapshot_date", "yyyy-MM-dd"))
+        .select(
+            "spart_no", "snapshot_date_str", "sloss_code", "sdetail_desc",
+            "rank_in_part", "cum_occurrences",
+            *([F.col("similarity_score"), F.col("embedding_source")] if has_embed else [])
+        )
+    )
+
+    return cands_pd_all
+
+
+with_history = get_top_candidates(
+    rank_with_loss_des,          # rank_df OR updated_rank_df
+    pairs_sdf,             # keys to restrict (spart_no, snapshot_date)
+    sample_keys_sdf,       # must have initial_loss_code
+    top_n=7
+ ).withColumn("similarity_score", F.lit(None).cast("double")).withColumn("embedding_source", F.lit(None).cast("string"))
+
+
+without_history =  get_top_candidates(
+    updated_rank_df,          # rank_df OR updated_rank_df
+    pairs_sdf,             # keys to restrict (spart_no, snapshot_date)
+    sample_keys_sdf,       # must have initial_loss_code
+    top_n=7
+ )
+
+combined_candas = with_history.union(without_history)
+# combined_candas.display()
+
+cands_pd_all = combined_candas.toPandas()
+
